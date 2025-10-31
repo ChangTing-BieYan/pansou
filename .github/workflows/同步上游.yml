@@ -1,0 +1,71 @@
+name: 同步上游仓库（保留ARMv7修改）
+
+on:
+  workflow_dispatch:  # 手动触发
+  schedule:
+    - cron: "0 */6 * * *"  # 每天 0点, 6点, 12点, 18点
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 设置 Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 添加上游仓库
+        run: |
+          git remote add upstream https://github.com/fish2018/pansou.git || true
+
+      - name: 检查上游是否有新提交
+        id: check
+        run: |
+          git fetch upstream main
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse FETCH_HEAD)
+          echo "LOCAL=$LOCAL" >> $GITHUB_ENV
+          echo "UPSTREAM=$UPSTREAM" >> $GITHUB_ENV
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "✅ 上游没有新提交，跳过同步"
+            exit 0
+          else
+            echo "🔄 上游有新提交"
+          fi
+
+      - name: 备份 ARMv7 修改文件
+        run: |
+          mkdir -p /tmp/mychanges/util/cache /tmp/mychanges/util/json
+          cp util/cache/sharded_memory_cache.go /tmp/mychanges/util/cache/ || true
+          cp util/cache/utils.go /tmp/mychanges/util/cache/ || true
+          cp util/cache/global_buffer_manager.go /tmp/mychanges/util/cache/ || true
+          cp util/json/json.go /tmp/mychanges/util/json/ || true
+          cp go.mod /tmp/mychanges/ || true
+
+      - name: 合并上游更新
+        run: |
+          git merge upstream/main -X theirs --no-edit || true
+
+      - name: 恢复 ARMv7 文件
+        run: |
+          cp /tmp/mychanges/util/cache/sharded_memory_cache.go util/cache/ || true
+          cp /tmp/mychanges/util/cache/utils.go util/cache/ || true
+          cp /tmp/mychanges/util/cache/global_buffer_manager.go util/cache/ || true
+          cp /tmp/mychanges/util/json/json.go util/json/ || true
+          cp /tmp/mychanges/go.mod . || true
+
+      - name: 提交并推送
+        run: |
+          git add .
+          if git diff --cached --quiet; then
+            echo "✅ 无变化，无需提交"
+          else
+            git commit -m "🔄 同步上游仓库（保留ARMv7修改）"
+            git push origin main
+          fi
