@@ -7,7 +7,6 @@ toolchain go1.24.9
 require (
 	github.com/Advik-B/cloudscraper v0.0.0-20250623142001-d5e0e43555db
 	github.com/PuerkitoBio/goquery v1.8.1
-	github.com/bytedance/sonic v1.14.0
 	github.com/gin-gonic/gin v1.9.1
 	github.com/golang-jwt/jwt/v5 v5.2.0
 	golang.org/x/net v0.41.0
@@ -16,7 +15,6 @@ require (
 require (
 	github.com/andybalholm/brotli v1.1.1 // indirect
 	github.com/andybalholm/cascadia v1.3.1 // indirect
-	github.com/bytedance/sonic/loader v0.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.5 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.2 // indirect
 	github.com/gin-contrib/sse v0.1.0 // indirect
