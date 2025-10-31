@@ -1,9 +1,9 @@
-name: 同步上游仓库（保留ARMv7修改）
+name: 同步上游仓库
 
 on:
   workflow_dispatch:  # 手动触发
   schedule:
-    - cron: "0 */6 * * *"  # 每天 0点, 6点, 12点, 18点
+    - cron: "0 */6 * * *"  # 每 6 小时执行一次
 
 jobs:
   sync:
@@ -47,10 +47,60 @@ jobs:
           cp util/cache/global_buffer_manager.go /tmp/mychanges/util/cache/ || true
           cp util/json/json.go /tmp/mychanges/util/json/ || true
           cp go.mod /tmp/mychanges/ || true
+          cp Dockerfile /tmp/mychanges/ || true
+          cp docker-compose.yml /tmp/mychanges/ || true
 
       - name: 合并上游更新
         run: |
           git merge upstream/main -X theirs --no-edit || true
+
+      - name: 保留本地 CHANNELS 与 ENABLED_PLUGINS
+        run: |
+          echo "🧩 检查并保留本地 CHANNELS 与 ENABLED_PLUGINS"
+
+          # ============ 处理 docker-compose.yml ============
+          if [ -f docker-compose.yml ] && [ -f /tmp/mychanges/docker-compose.yml ]; then
+            LOCAL_CHANNELS=$(grep -E '^\s*- CHANNELS=' /tmp/mychanges/docker-compose.yml || true)
+            LOCAL_PLUGINS=$(grep -E '^\s*- ENABLED_PLUGINS=' /tmp/mychanges/docker-compose.yml || true)
+
+            grep -v -E '^\s*- (CHANNELS|ENABLED_PLUGINS)=' docker-compose.yml > /tmp/upstream_clean.yml
+            grep -v -E '^\s*- (CHANNELS|ENABLED_PLUGINS)=' /tmp/mychanges/docker-compose.yml > /tmp/local_clean.yml
+
+            if cmp -s /tmp/upstream_clean.yml /tmp/local_clean.yml; then
+              echo "✅ 上游只修改了 CHANNELS 或 ENABLED_PLUGINS，不合并 docker-compose.yml"
+              cp /tmp/mychanges/docker-compose.yml docker-compose.yml
+            else
+              echo "🔄 上游修改了其他内容，合并并恢复本地 CHANNELS 与 ENABLED_PLUGINS"
+              if [ -n "$LOCAL_CHANNELS" ]; then
+                sed -i "/- CHANNELS=/c\\$LOCAL_CHANNELS" docker-compose.yml
+              fi
+              if [ -n "$LOCAL_PLUGINS" ]; then
+                sed -i "/- ENABLED_PLUGINS=/c\\$LOCAL_PLUGINS" docker-compose.yml
+              fi
+            fi
+          fi
+
+          # ============ 处理 Dockerfile ============
+          if [ -f Dockerfile ] && [ -f /tmp/mychanges/Dockerfile ]; then
+            LOCAL_CHANNELS=$(grep '^ENV CHANNELS=' /tmp/mychanges/Dockerfile || true)
+            LOCAL_PLUGINS=$(grep '^ENV ENABLED_PLUGINS=' /tmp/mychanges/Dockerfile || true)
+
+            grep -v -E '^ENV (CHANNELS|ENABLED_PLUGINS)=' Dockerfile > /tmp/upstream_clean_dockerfile
+            grep -v -E '^ENV (CHANNELS|ENABLED_PLUGINS)=' /tmp/mychanges/Dockerfile > /tmp/local_clean_dockerfile
+
+            if cmp -s /tmp/upstream_clean_dockerfile /tmp/local_clean_dockerfile; then
+              echo "✅ 上游只修改了 CHANNELS 或 ENABLED_PLUGINS，不合并 Dockerfile"
+              cp /tmp/mychanges/Dockerfile Dockerfile
+            else
+              echo "🔄 上游修改了其他内容，合并并恢复本地 CHANNELS 与 ENABLED_PLUGINS"
+              if [ -n "$LOCAL_CHANNELS" ]; then
+                sed -i "/^ENV CHANNELS=/c\\$LOCAL_CHANNELS" Dockerfile
+              fi
+              if [ -n "$LOCAL_PLUGINS" ]; then
+                sed -i "/^ENV ENABLED_PLUGINS=/c\\$LOCAL_PLUGINS" Dockerfile
+              fi
+            fi
+          fi
 
       - name: 恢复 ARMv7 文件
         run: |
@@ -66,6 +116,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "✅ 无变化，无需提交"
           else
-            git commit -m "🔄 同步上游仓库（保留ARMv7修改）"
+            git commit -m "🔄 同步上游仓库（保留ARMv7修改 & CHANNELS/ENABLED_PLUGINS）"
             git push origin main
           fi
