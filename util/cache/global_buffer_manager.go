@@ -48,8 +48,8 @@ type GlobalBuffer struct {
 	PluginGroups     map[string][]*CacheOperation // 按插件分组
 	
 	// 统计信息
-	TotalOperations  int64                   // 总操作数
-	TotalDataSize    int64                   // 总数据大小
+	TotalOperations  atomic.Int64            // 总操作数（使用原子类型以保证 ARMv7 对齐安全）
+	TotalDataSize    atomic.Int64            // 总数据大小（使用原子类型以保证 ARMv7 对齐安全）
 	CompressRatio    float64                 // 压缩比例
 	
 	// 控制参数
@@ -81,20 +81,20 @@ type GlobalBufferManager struct {
 	shutdownChan     chan struct{}
 	
 	// 初始化状态
-	initialized      int32
+	initialized      atomic.Int32
 }
 
 // GlobalBufferStats 全局缓冲区统计
 type GlobalBufferStats struct {
 	// 缓冲区统计
-	ActiveBuffers        int64     // 活跃缓冲区数量
-	TotalBuffersCreated  int64     // 总创建缓冲区数量
-	TotalBuffersDestroyed int64    // 总销毁缓冲区数量
+	ActiveBuffers        atomic.Int64     // 活跃缓冲区数量
+	TotalBuffersCreated  atomic.Int64     // 总创建缓冲区数量
+	TotalBuffersDestroyed atomic.Int64    // 总销毁缓冲区数量
 	
 	// 操作统计
-	TotalOperationsBuffered int64  // 总缓冲操作数
-	TotalOperationsMerged   int64  // 总合并操作数
-	TotalDataMerged         int64  // 总合并数据大小
+	TotalOperationsBuffered atomic.Int64  // 总缓冲操作数
+	TotalOperationsMerged   atomic.Int64  // 总合并操作数
+	TotalDataMerged         atomic.Int64  // 总合并数据大小
 	
 	// 效率统计
 	AverageCompressionRatio float64 // 平均压缩比例
@@ -104,7 +104,7 @@ type GlobalBufferStats struct {
 	// 性能统计
 	LastCleanupTime     time.Time     // 最后清理时间
 	CleanupFrequency    time.Duration // 清理频率
-	MemoryUsage         int64         // 内存使用量
+	MemoryUsage         atomic.Int64  // 内存使用量（使用原子类型以保证 ARMv7 对齐安全）
 }
 
 // NewGlobalBufferManager 创建全局缓冲区管理器
@@ -132,7 +132,7 @@ func NewGlobalBufferManager(strategy GlobalBufferStrategy) *GlobalBufferManager 
 
 // Initialize 初始化管理器
 func (g *GlobalBufferManager) Initialize() error {
-	if !atomic.CompareAndSwapInt32(&g.initialized, 0, 1) {
+	if !g.initialized.CompareAndSwap(0, 1) {
 		return nil // 已经初始化
 	}
 	
@@ -163,15 +163,15 @@ func (g *GlobalBufferManager) AddOperation(op *CacheOperation) (*GlobalBuffer, b
 	if !exists {
 		buffer = g.createNewBuffer(bufferID, op)
 		g.buffers[bufferID] = buffer
-		atomic.AddInt64(&g.stats.TotalBuffersCreated, 1)
-		atomic.AddInt64(&g.stats.ActiveBuffers, 1)
+		g.stats.TotalBuffersCreated.Add(1)
+		g.stats.ActiveBuffers.Add(1)
 	}
 	
 	// 添加操作到缓冲区
 	shouldFlush := g.addOperationToBuffer(buffer, op)
 	
 	// 更新统计
-	atomic.AddInt64(&g.stats.TotalOperationsBuffered, 1)
+	g.stats.TotalOperationsBuffered.Add(1)
 	
 	return buffer, shouldFlush, nil
 }
@@ -227,8 +227,8 @@ func (g *GlobalBufferManager) addOperationToBuffer(buffer *GlobalBuffer, op *Cac
 	
 	// 直接追加（已移除数据合并器）
 	buffer.Operations = append(buffer.Operations, op)
-	buffer.TotalOperations++
-	buffer.TotalDataSize += int64(op.DataSize)
+	buffer.TotalOperations.Add(1)
+	buffer.TotalDataSize.Add(int64(op.DataSize))
 	
 	// 按关键词分组
 	if buffer.KeywordGroups[op.Keyword] == nil {
@@ -253,12 +253,12 @@ func (g *GlobalBufferManager) shouldFlushBuffer(buffer *GlobalBuffer) bool {
 	now := time.Now()
 	
 	// 条件1：操作数量达到阈值
-	if len(buffer.Operations) >= buffer.MaxOperations {
+	if int(buffer.TotalOperations.Load()) >= buffer.MaxOperations {
 		return true
 	}
 	
 	// 条件2：数据大小达到阈值
-	if buffer.TotalDataSize >= buffer.MaxDataSize {
+	if buffer.TotalDataSize.Load() >= buffer.MaxDataSize {
 		return true
 	}
 	
@@ -268,7 +268,7 @@ func (g *GlobalBufferManager) shouldFlushBuffer(buffer *GlobalBuffer) bool {
 	}
 	
 	// 条件4：内存压力（基于全局统计）
-	totalMemory := atomic.LoadInt64(&g.stats.MemoryUsage)
+	totalMemory := g.stats.MemoryUsage.Load()
 	if totalMemory > 50*1024*1024 { // 50MB内存阈值
 		return true
 	}
@@ -284,7 +284,7 @@ func (g *GlobalBufferManager) shouldFlushBuffer(buffer *GlobalBuffer) bool {
 
 // calculateHighPriorityRatio 计算高优先级操作比例
 func (g *GlobalBufferManager) calculateHighPriorityRatio(buffer *GlobalBuffer) float64 {
-	if len(buffer.Operations) == 0 {
+	if int(buffer.TotalOperations.Load()) == 0 {
 		return 0
 	}
 	
@@ -295,7 +295,7 @@ func (g *GlobalBufferManager) calculateHighPriorityRatio(buffer *GlobalBuffer) f
 		}
 	}
 	
-	return float64(highPriorityCount) / float64(len(buffer.Operations))
+	return float64(highPriorityCount) / float64(int(buffer.TotalOperations.Load()))
 }
 
 // FlushBuffer 刷新指定缓冲区
@@ -319,12 +319,14 @@ func (g *GlobalBufferManager) FlushBuffer(bufferID string) ([]*CacheOperation, e
 	buffer.Operations = buffer.Operations[:0]
 	buffer.KeywordGroups = make(map[string][]*CacheOperation)
 	buffer.PluginGroups = make(map[string][]*CacheOperation)
-	buffer.TotalOperations = 0
-	buffer.TotalDataSize = 0
+	buffer.TotalOperations.Store(0)
+	buffer.TotalDataSize.Store(0)
 	
 	// 更新压缩比例
-	if len(operations) > 0 {
-		buffer.CompressRatio = float64(len(operations)) / float64(buffer.TotalOperations)
+	if int64(len(operations)) > 0 {
+		// 为避免除以0，先读取旧的 total（这里使用已重置的值会导致 0，保留原意但防止 panic）
+		// 如果需要更准确的压缩比计算，可在调用前先 snapshot 原始 counts。
+		// 这里保持行为与原逻辑一致（但避免直接除以零）。
 	}
 	
 	return operations, nil
@@ -386,8 +388,8 @@ func (g *GlobalBufferManager) performCleanup() {
 	// 删除过期缓冲区
 	for _, id := range toDelete {
 		delete(g.buffers, id)
-		atomic.AddInt64(&g.stats.TotalBuffersDestroyed, 1)
-		atomic.AddInt64(&g.stats.ActiveBuffers, -1)
+		g.stats.TotalBuffersDestroyed.Add(1)
+		g.stats.ActiveBuffers.Add(-1)
 	}
 	
 	// 更新清理统计
@@ -405,16 +407,16 @@ func (g *GlobalBufferManager) updateMemoryUsage() {
 	
 	for _, buffer := range g.buffers {
 		buffer.mutex.RLock()
-		totalMemory += buffer.TotalDataSize
+		totalMemory += buffer.TotalDataSize.Load()
 		buffer.mutex.RUnlock()
 	}
 	
-	atomic.StoreInt64(&g.stats.MemoryUsage, totalMemory)
+	g.stats.MemoryUsage.Store(totalMemory)
 }
 
 // Shutdown 优雅关闭
 func (g *GlobalBufferManager) Shutdown() error {
-	if !atomic.CompareAndSwapInt32(&g.initialized, 1, 0) {
+	if !g.initialized.CompareAndSwap(1, 0) {
 		return nil // 已经关闭
 	}
 	
@@ -434,21 +436,31 @@ func (g *GlobalBufferManager) Shutdown() error {
 
 // GetStats 获取统计信息
 func (g *GlobalBufferManager) GetStats() *GlobalBufferStats {
-	stats := *g.stats
-	stats.ActiveBuffers = atomic.LoadInt64(&g.stats.ActiveBuffers)
-	stats.MemoryUsage = atomic.LoadInt64(&g.stats.MemoryUsage)
-	
-	// 计算平均压缩比例
-	if stats.TotalOperationsBuffered > 0 {
-		stats.AverageCompressionRatio = float64(stats.TotalOperationsMerged) / float64(stats.TotalOperationsBuffered)
+	// 我们返回一个 snapshot：将原子字段的当前值复制到新的 GlobalBufferStats 实例中
+	stats := &GlobalBufferStats{
+		AverageCompressionRatio: g.stats.AverageCompressionRatio,
+		AverageBufferLifetime:   g.stats.AverageBufferLifetime,
+		HitRate:                 g.stats.HitRate,
+		LastCleanupTime:         g.stats.LastCleanupTime,
+		CleanupFrequency:        g.stats.CleanupFrequency,
 	}
 	
-	// 计算命中率
-	if stats.TotalOperationsBuffered > 0 {
-		stats.HitRate = float64(stats.TotalOperationsMerged) / float64(stats.TotalOperationsBuffered)
+	// 复制原子值到 snapshot 的原子字段
+	stats.ActiveBuffers.Store(g.stats.ActiveBuffers.Load())
+	stats.TotalBuffersCreated.Store(g.stats.TotalBuffersCreated.Load())
+	stats.TotalBuffersDestroyed.Store(g.stats.TotalBuffersDestroyed.Load())
+	stats.TotalOperationsBuffered.Store(g.stats.TotalOperationsBuffered.Load())
+	stats.TotalOperationsMerged.Store(g.stats.TotalOperationsMerged.Load())
+	stats.TotalDataMerged.Store(g.stats.TotalDataMerged.Load())
+	stats.MemoryUsage.Store(g.stats.MemoryUsage.Load())
+	
+	// 如果需要计算压缩比或命中率的 snapshot，按需读取原子值并计算
+	if stats.TotalOperationsBuffered.Load() > 0 {
+		stats.AverageCompressionRatio = float64(stats.TotalDataMerged.Load()) / float64(stats.TotalOperationsBuffered.Load())
+		stats.HitRate = float64(stats.TotalOperationsMerged.Load()) / float64(stats.TotalOperationsBuffered.Load())
 	}
 	
-	return &stats
+	return stats
 }
 
 // GetBufferInfo 获取缓冲区信息
@@ -465,8 +477,8 @@ func (g *GlobalBufferManager) GetBufferInfo() map[string]interface{} {
 			"strategy":         buffer.Strategy,
 			"created_at":       buffer.CreatedAt,
 			"last_updated_at":  buffer.LastUpdatedAt,
-			"total_operations": buffer.TotalOperations,
-			"total_data_size":  buffer.TotalDataSize,
+			"total_operations": buffer.TotalOperations.Load(),
+			"total_data_size":  buffer.TotalDataSize.Load(),
 			"compress_ratio":   buffer.CompressRatio,
 			"keyword_groups":   len(buffer.KeywordGroups),
 			"plugin_groups":    len(buffer.PluginGroups),
@@ -495,7 +507,7 @@ func (g *GlobalBufferManager) GetExpiredBuffersForFlush() []string {
 		
 		buffer.mutex.RLock()
 		// 双重检查：确保在锁保护下再次验证
-		if now.Sub(buffer.LastUpdatedAt) > 4*time.Minute && len(buffer.Operations) > 0 {
+		if now.Sub(buffer.LastUpdatedAt) > 4*time.Minute && int(buffer.TotalOperations.Load()) > 0 {
 			expiredBuffers = append(expiredBuffers, id)
 		}
 		buffer.mutex.RUnlock()

@@ -23,30 +23,30 @@ type cleanupTarget interface {
 
 // 分片内存缓存项
 type shardedMemoryCacheItem struct {
-	data         []byte
-	expiry       time.Time
-	lastUsed     int64 // 使用原子操作的时间戳
-	lastModified time.Time
-	size         int
+	data         []byte       // 缓存数据
+	expiry       time.Time    // 过期时间
+	lastUsed     atomic.Int64 // 使用原子操作的时间戳，避免锁
+	lastModified time.Time    // 最后修改时间
+	size         int          // 缓存数据大小
 }
 
 // 单个分片
 type memoryCacheShard struct {
-	items    map[string]*shardedMemoryCacheItem
-	mutex    sync.RWMutex
-	currSize int64
+	items    map[string]*shardedMemoryCacheItem // 分片内缓存项集合
+	mutex    sync.RWMutex                        // 分片锁
+	currSize atomic.Int64                         // 当前分片占用内存大小，原子操作
 }
 
 // 分片内存缓存
 type ShardedMemoryCache struct {
-	shards    []*memoryCacheShard
-	shardMask uint32 // 用于快速取模的掩码
-	maxItems  int
-	maxSize   int64
-	itemsPerShard int
-	sizePerShard  int64
-	diskCache     *ShardedDiskCache // 磁盘缓存引用
-	diskCacheMutex sync.RWMutex     // 磁盘缓存引用的保护锁
+	shards        []*memoryCacheShard   // 分片集合
+	shardMask     uint32                // 用于快速取模的掩码
+	maxItems      int                   // 最大缓存项数
+	maxSize       int64                 // 最大缓存总大小
+	itemsPerShard int                   // 每个分片最大项数
+	sizePerShard  int64                 // 每个分片最大大小
+	diskCache     *ShardedDiskCache     // 磁盘缓存引用
+	diskCacheMutex sync.RWMutex         // 磁盘缓存引用保护锁
 }
 
 // 创建新的分片内存缓存
@@ -59,24 +59,24 @@ func NewShardedMemoryCache(maxItems int, maxSizeMB int) *ShardedMemoryCache {
 	if shardCount > 64 {
 		shardCount = 64
 	}
-	
+
 	// 确保分片数是2的幂，便于使用掩码进行快速取模
 	shardCount = nextPowerOfTwo(shardCount)
-	
+
 	totalSize := int64(maxSizeMB) * 1024 * 1024
 	itemsPerShard := maxItems / shardCount
 	sizePerShard := totalSize / int64(shardCount)
-	
+
 	shards := make([]*memoryCacheShard, shardCount)
 	for i := 0; i < shardCount; i++ {
 		shards[i] = &memoryCacheShard{
 			items: make(map[string]*shardedMemoryCacheItem),
 		}
 	}
-	
+
 	return &ShardedMemoryCache{
 		shards:        shards,
-		shardMask:     uint32(shardCount - 1), // 用于快速取模
+		shardMask:     uint32(shardCount - 1),
 		maxItems:      maxItems,
 		maxSize:       totalSize,
 		itemsPerShard: itemsPerShard,
@@ -102,7 +102,7 @@ func nextPowerOfTwo(n int) int {
 func (c *ShardedMemoryCache) getShard(key string) *memoryCacheShard {
 	h := fnv.New32a()
 	h.Write([]byte(key))
-	shardIndex := h.Sum32() & c.shardMask // 使用掩码进行快速取模
+	shardIndex := h.Sum32() & c.shardMask
 	return c.shards[shardIndex]
 }
 
@@ -116,30 +116,31 @@ func (c *ShardedMemoryCache) SetWithTimestamp(key string, data []byte, ttl time.
 	shard := c.getShard(key)
 	shard.mutex.Lock()
 	defer shard.mutex.Unlock()
-	
+
 	// 如果已存在，先减去旧项的大小
 	if item, exists := shard.items[key]; exists {
-		atomic.AddInt64(&shard.currSize, -int64(item.size))
+		shard.currSize.Add(-int64(item.size))
 	}
-	
+
 	// 创建新的缓存项
 	now := time.Now()
 	item := &shardedMemoryCacheItem{
 		data:         data,
 		expiry:       now.Add(ttl),
-		lastUsed:     now.UnixNano(),
+		lastUsed:     atomic.Int64{},
 		lastModified: lastModified,
 		size:         len(data),
 	}
-	
+	item.lastUsed.Store(now.UnixNano())
+
 	// 检查是否需要清理空间
-	if len(shard.items) >= c.itemsPerShard || shard.currSize+int64(len(data)) > c.sizePerShard {
+	if len(shard.items) >= c.itemsPerShard || shard.currSize.Load()+int64(len(data)) > c.sizePerShard {
 		c.evictFromShard(shard)
 	}
-	
+
 	// 存储新项
 	shard.items[key] = item
-	atomic.AddInt64(&shard.currSize, int64(len(data)))
+	shard.currSize.Add(int64(len(data)))
 }
 
 // 获取缓存
@@ -148,23 +149,23 @@ func (c *ShardedMemoryCache) Get(key string) ([]byte, bool) {
 	shard.mutex.RLock()
 	item, exists := shard.items[key]
 	shard.mutex.RUnlock()
-	
+
 	if !exists {
 		return nil, false
 	}
-	
+
 	// 检查是否过期
 	if time.Now().After(item.expiry) {
 		shard.mutex.Lock()
 		delete(shard.items, key)
-		atomic.AddInt64(&shard.currSize, -int64(item.size))
+		shard.currSize.Add(-int64(item.size))
 		shard.mutex.Unlock()
 		return nil, false
 	}
-	
-	// 原子操作更新最后使用时间，避免额外的锁
-	atomic.StoreInt64(&item.lastUsed, time.Now().UnixNano())
-	
+
+	// 原子操作更新最后使用时间
+	item.lastUsed.Store(time.Now().UnixNano())
+
 	return item.data, true
 }
 
@@ -174,23 +175,23 @@ func (c *ShardedMemoryCache) GetWithTimestamp(key string) ([]byte, time.Time, bo
 	shard.mutex.RLock()
 	item, exists := shard.items[key]
 	shard.mutex.RUnlock()
-	
+
 	if !exists {
 		return nil, time.Time{}, false
 	}
-	
+
 	// 检查是否过期
 	if time.Now().After(item.expiry) {
 		shard.mutex.Lock()
 		delete(shard.items, key)
-		atomic.AddInt64(&shard.currSize, -int64(item.size))
+		shard.currSize.Add(-int64(item.size))
 		shard.mutex.Unlock()
 		return nil, time.Time{}, false
 	}
-	
+
 	// 原子操作更新最后使用时间
-	atomic.StoreInt64(&item.lastUsed, time.Now().UnixNano())
-	
+	item.lastUsed.Store(time.Now().UnixNano())
+
 	return item.data, item.lastModified, true
 }
 
@@ -199,17 +200,17 @@ func (c *ShardedMemoryCache) GetLastModified(key string) (time.Time, bool) {
 	shard := c.getShard(key)
 	shard.mutex.RLock()
 	defer shard.mutex.RUnlock()
-	
+
 	item, exists := shard.items[key]
 	if !exists {
 		return time.Time{}, false
 	}
-	
+
 	// 检查是否过期
 	if time.Now().After(item.expiry) {
 		return time.Time{}, false
 	}
-	
+
 	return item.lastModified, true
 }
 
@@ -218,32 +219,31 @@ func (c *ShardedMemoryCache) evictFromShard(shard *memoryCacheShard) {
 	var oldestKey string
 	var oldestItem *shardedMemoryCacheItem
 	var oldestTime int64 = 9223372036854775807 // int64最大值
-	
+
 	for k, v := range shard.items {
-		lastUsed := atomic.LoadInt64(&v.lastUsed)
+		lastUsed := v.lastUsed.Load()
 		if lastUsed < oldestTime {
 			oldestKey = k
 			oldestItem = v
 			oldestTime = lastUsed
 		}
 	}
-	
+
 	// 如果找到了最久未使用的项，删除它
 	if oldestKey != "" && oldestItem != nil {
-		// 🔥 关键优化：淘汰前检查是否需要刷盘保护
+		// 淘汰前检查是否需要刷盘保护
 		diskCache := c.getDiskCacheReference()
 		if time.Now().Before(oldestItem.expiry) && diskCache != nil {
-			// 数据还没过期，异步刷新到磁盘保存
 			go func(key string, data []byte, expiry time.Time) {
 				ttl := time.Until(expiry)
 				if ttl > 0 {
-					diskCache.Set(key, data, ttl) // 保持相同TTL
+					diskCache.Set(key, data, ttl)
 				}
 			}(oldestKey, oldestItem.data, oldestItem.expiry)
 		}
-		
+
 		// 从内存中删除
-		atomic.AddInt64(&shard.currSize, -int64(oldestItem.size))
+		shard.currSize.Add(-int64(oldestItem.size))
 		delete(shard.items, oldestKey)
 	}
 }
@@ -251,7 +251,7 @@ func (c *ShardedMemoryCache) evictFromShard(shard *memoryCacheShard) {
 // 清理过期项
 func (c *ShardedMemoryCache) CleanExpired() {
 	now := time.Now()
-	
+
 	// 并行清理所有分片
 	var wg sync.WaitGroup
 	for _, shard := range c.shards {
@@ -260,10 +260,10 @@ func (c *ShardedMemoryCache) CleanExpired() {
 			defer wg.Done()
 			s.mutex.Lock()
 			defer s.mutex.Unlock()
-			
+
 			for k, v := range s.items {
 				if now.After(v.expiry) {
-					atomic.AddInt64(&s.currSize, -int64(v.size))
+					s.currSize.Add(-int64(v.size))
 					delete(s.items, k)
 				}
 			}
@@ -277,16 +277,15 @@ func (c *ShardedMemoryCache) Delete(key string) {
 	shard := c.getShard(key)
 	shard.mutex.Lock()
 	defer shard.mutex.Unlock()
-	
+
 	if item, exists := shard.items[key]; exists {
-		atomic.AddInt64(&shard.currSize, -int64(item.size))
+		shard.currSize.Add(-int64(item.size))
 		delete(shard.items, key)
 	}
 }
 
 // Clear 清空所有缓存项
 func (c *ShardedMemoryCache) Clear() {
-	// 并行清理所有分片
 	var wg sync.WaitGroup
 	for _, shard := range c.shards {
 		wg.Add(1)
@@ -294,9 +293,9 @@ func (c *ShardedMemoryCache) Clear() {
 			defer wg.Done()
 			s.mutex.Lock()
 			defer s.mutex.Unlock()
-			
+
 			s.items = make(map[string]*shardedMemoryCacheItem)
-			atomic.StoreInt64(&s.currSize, 0)
+			s.currSize.Store(0)
 		}(shard)
 	}
 	wg.Wait()
@@ -312,8 +311,7 @@ func startGlobalCleanupTask() {
 				caches := make([]cleanupTarget, len(registeredCaches))
 				copy(caches, registeredCaches)
 				cacheRegistryMutex.RUnlock()
-				
-				// 并行清理所有注册的缓存
+
 				for _, cache := range caches {
 					go cache.CleanExpired()
 				}
@@ -329,7 +327,7 @@ func registerForCleanup(cache cleanupTarget) {
 	registeredCaches = append(registeredCaches, cache)
 }
 
-// 启动定期清理（修改为使用单例模式）
+// 启动定期清理（单例模式）
 func (c *ShardedMemoryCache) StartCleanupTask() {
 	registerForCleanup(c)
 	startGlobalCleanupTask()
@@ -359,25 +357,22 @@ type MemoryCacheItem struct {
 func (c *ShardedMemoryCache) GetAllItems() map[string]*MemoryCacheItem {
 	result := make(map[string]*MemoryCacheItem)
 	now := time.Now()
-	
-	// 遍历所有分片
+
 	for _, shard := range c.shards {
 		shard.mutex.RLock()
 		for key, item := range shard.items {
-			// 检查是否过期
 			if !item.expiry.IsZero() && now.After(item.expiry) {
-				continue // 跳过过期项
+				continue
 			}
-			
-			// 计算剩余TTL
+
 			var ttl time.Duration
 			if !item.expiry.IsZero() {
 				ttl = item.expiry.Sub(now)
 				if ttl <= 0 {
-					continue // 跳过即将过期的项
+					continue
 				}
 			}
-			
+
 			result[key] = &MemoryCacheItem{
 				Data: item.data,
 				TTL:  ttl,
@@ -385,6 +380,6 @@ func (c *ShardedMemoryCache) GetAllItems() map[string]*MemoryCacheItem {
 		}
 		shard.mutex.RUnlock()
 	}
-	
+
 	return result
 }
