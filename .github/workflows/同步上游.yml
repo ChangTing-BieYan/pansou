@@ -1,64 +1,68 @@
 name: 同步上游
 
 on:
-  workflow_dispatch:        # 手动触发
+  workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"   # 每 6 小时自动运行一次
+    - cron: "0 */6 * * *"  # 每6小时自动执行一次
 
 jobs:
-  sync-upstream:
+  sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 设置 Git 用户
+      - name: 配置Git信息
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: 添加上游仓库并抓取
+      - name: 添加上游仓库
         run: |
           git remote add upstream https://github.com/fish2018/pansou.git || true
           git fetch upstream main
 
-      - name: 保存本地修改（备份你改过的 Go 文件与 go.mod）
+      - name: 获取SHA
+        id: sha
         run: |
-          mkdir -p /tmp/mychanges/util/cache /tmp/mychanges/util/json
-          cp util/cache/sharded_memory_cache.go /tmp/mychanges/util/cache/ || true
-          cp util/cache/utils.go /tmp/mychanges/util/cache/ || true
-          cp util/cache/global_buffer_manager.go /tmp/mychanges/util/cache/ || true
-          cp util/json/json.go /tmp/mychanges/util/json/ || true
-          cp go.mod /tmp/mychanges/ || true
+          echo "UPSTREAM_SHA=$(git rev-parse upstream/main)" >> $GITHUB_ENV
+          echo "LOCAL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
 
-      - name: 检查上游差异并尝试合并
+      - name: 检查上游更新
+        if: env.UPSTREAM_SHA != env.LOCAL_SHA
         run: |
-          git fetch upstream main
-          # 如果内容无差异则跳过
-          if git diff --quiet HEAD upstream/main; then
-            echo "✅ 上游与本地一致，无需同步"
-          else
-            echo "🔄 上游有新提交，正在合并（上游优先）..."
-            git merge upstream/main -X theirs --no-edit || true
-          fi
+          echo "🔄 上游有新提交，正在合并（上游优先）..."
+          git merge upstream/main --no-edit || true
 
-      - name: 恢复本地修改（覆盖被上游改动的文件）
+      - name: 恢复本地修改（仅限 ARMv7 兼容改动的 go 文件）
+        if: env.UPSTREAM_SHA != env.LOCAL_SHA
         run: |
-          cp /tmp/mychanges/util/cache/sharded_memory_cache.go util/cache/ || true
-          cp /tmp/mychanges/util/cache/utils.go util/cache/ || true
-          cp /tmp/mychanges/util/cache/global_buffer_manager.go util/cache/ || true
-          cp /tmp/mychanges/util/json/json.go util/json/ || true
-          cp /tmp/mychanges/go.mod . || true
+          echo "🔁 恢复保留的 Go 文件（ARMv7 兼容修改）..."
+          # 仅恢复本地修改过的 Go 文件，而不是所有 *.go 文件
+          for f in $(git diff --name-only --diff-filter=U | grep '\.go$' || true); do
+            echo "保留本地修改: $f"
+            git checkout --ours "$f"
+            git add "$f"
+          done
+          git merge --continue || true
+
+      - name: 调试输出差异
+        if: env.UPSTREAM_SHA != env.LOCAL_SHA
+        run: |
+          echo "------ git status ------"
+          git status
+          echo "------ git diff --stat ------"
+          git diff --stat
 
       - name: 提交并推送更新
+        if: env.UPSTREAM_SHA != env.LOCAL_SHA
         run: |
           git add .
           if git diff --cached --quiet; then
             echo "✅ 无变化，无需提交"
           else
-            git commit -m "🔄 同步上游仓库（保留 ARMv7 兼容 Go 修改与 go.mod）"
+            git commit -m "🔄 同步上游仓库（保留 ARMv7 兼容 Go 修改）"
             git push origin main
           fi
