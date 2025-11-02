@@ -81,6 +81,10 @@ import (
 	_ "pansou/plugin/yunsou"
 	_ "pansou/plugin/ahhhhfs"
 	_ "pansou/plugin/nsgame"
+	_ "pansou/plugin/quark4k"
+	_ "pansou/plugin/quarksoo"
+	_ "pansou/plugin/sousou"
+	_ "pansou/plugin/ash"
 )
 
 // 全局缓存写入管理器
