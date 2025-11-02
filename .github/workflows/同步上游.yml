@@ -3,10 +3,10 @@ name: 同步上游
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"  # 每6小时自动执行一次
+    - cron: "0 */6 * * *"
 
 jobs:
-  sync:
+  sync-upstream:
     runs-on: ubuntu-latest
     steps:
       - name: 检出仓库
@@ -14,55 +14,53 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: 配置Git信息
+      - name: 设置 Git
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: 添加上游仓库
         run: |
           git remote add upstream https://github.com/fish2018/pansou.git || true
           git fetch upstream main
 
-      - name: 获取SHA
-        id: sha
+      - name: 检查上游是否有新提交
+        id: check
         run: |
-          echo "UPSTREAM_SHA=$(git rev-parse upstream/main)" >> $GITHUB_ENV
-          echo "LOCAL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse FETCH_HEAD)
+          echo "LOCAL=$LOCAL"
+          echo "UPSTREAM=$UPSTREAM"
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "✅ 上游没有新提交，跳过同步"
+            exit 0
+          else
+            echo "🔄 上游有新提交"
+          fi
 
-      - name: 检查上游更新
-        if: env.UPSTREAM_SHA != env.LOCAL_SHA
+      - name: 合并上游（上游优先）
         run: |
-          echo "🔄 上游有新提交，正在合并（上游优先）..."
+          git checkout main
           git merge upstream/main --no-edit || true
 
-      - name: 恢复本地修改（仅限 ARMv7 兼容改动的 go 文件）
-        if: env.UPSTREAM_SHA != env.LOCAL_SHA
+      - name: 恢复本地修改（仅限 ARMv7 兼容 Go 文件）
         run: |
           echo "🔁 恢复保留的 Go 文件（ARMv7 兼容修改）..."
-          # 仅恢复本地修改过的 Go 文件，而不是所有 *.go 文件
-          for f in $(git diff --name-only --diff-filter=U | grep '\.go$' || true); do
-            echo "保留本地修改: $f"
-            git checkout --ours "$f"
-            git add "$f"
-          done
-          git merge --continue || true
+          conflict_files=$(git diff --name-only --diff-filter=U)
+          if [ -n "$conflict_files" ]; then
+            for f in $conflict_files; do
+              if [[ "$f" == *.go ]]; then
+                git checkout --ours "$f"
+                git add "$f"
+              fi
+            done
+            git merge --continue || true
+          else
+            echo "⚡ 没有冲突文件，跳过恢复"
+          fi
 
-      - name: 调试输出差异
-        if: env.UPSTREAM_SHA != env.LOCAL_SHA
-        run: |
-          echo "------ git status ------"
-          git status
-          echo "------ git diff --stat ------"
-          git diff --stat
-
-      - name: 提交并推送更新
-        if: env.UPSTREAM_SHA != env.LOCAL_SHA
+      - name: 提交并推送
         run: |
           git add .
-          if git diff --cached --quiet; then
-            echo "✅ 无变化，无需提交"
-          else
-            git commit -m "🔄 同步上游仓库（保留 ARMv7 兼容 Go 修改）"
-            git push origin main
-          fi
+          git diff --cached --quiet || git commit -m "🔄 同步上游仓库（保留 ARMv7 兼容 Go 修改）"
+          git push origin main
