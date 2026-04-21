@@ -9,6 +9,7 @@ require (
 	github.com/PuerkitoBio/goquery v1.8.1
 	github.com/gin-gonic/gin v1.9.1
 	github.com/golang-jwt/jwt/v5 v5.2.0
+	go.etcd.io/bbolt v1.4.0
 	golang.org/x/net v0.41.0
 )
 
