@@ -32,9 +32,9 @@ https://www.gying.net
 
 | 功能 | URL |
 | --- | --- |
-| 登录页 | `{baseURL}/user/login/` |
+| 登录页 / 初始会话页 | `{baseURL}` |
 | 登录接口 | `{baseURL}/user/login` |
-| 搜索页 | `{baseURL}/s/1---1/{keyword}` |
+| 搜索页 | `{baseURL}/search?q={keyword}&type=&mode=1` |
 | 详情接口 | `{baseURL}/res/downurl/{type}/{id}` |
 | 预热详情页 | `{baseURL}/mv/wkMn` |
 
@@ -54,7 +54,7 @@ https://www.gying.net
 搜索与详情请求也不是写死域名，而是分别拼接为：
 
 ```text
-{baseURL}/s/1---1/{keyword}
+{baseURL}/search?q={keyword}&type=&mode=1
 {baseURL}/res/downurl/{type}/{id}
 ```
 
@@ -67,10 +67,14 @@ https://www.gying.net
 
 ### 识别方式
 
-插件会把下面两条同时成立的响应视为挑战页：
+插件会把“页面中存在如下 JS 片段”且正文包含任一验证文案的响应视为挑战页：
 
-1. 页面文本包含 `正在确认你是不是机器人`
-2. 页面中存在如下 JS 片段：
+- `正在确认你是不是机器人`
+- `浏览器安全验证`
+- `安全验证`
+- `正在进行浏览器计算验证`
+
+挑战页中会出现如下 JS 片段：
 
 ```javascript
 const json={...};const jss=
@@ -129,7 +133,7 @@ action=verify&id={id}&nonce[]={n1}&nonce[]={n2}...
 请求：
 
 ```text
-GET {baseURL}/user/login/
+GET {baseURL}
 ```
 
 作用：
@@ -176,14 +180,37 @@ GET {baseURL}/mv/wkMn
 
 - HTTP 403
 - 返回登录壳页面：`_BT.PC.HTML('login')`
+- 返回未登录壳页面：`_BT.PC.HTML('nologin')`
+- 页面标题或正文出现 `未登录，访问受限`
 - 详情 JSON 里的 `code == 403`
+
+### Cookie 生命周期
+
+当前站点至少有两类不同作用的 Cookie：
+
+- 登录态 Cookie：例如 `PHPSESSID`、`app_auth`
+- 验证态 Cookie：例如 `browser_verified`
+
+两者不是同一层状态：
+
+- 只有登录态，没有验证态：搜索时仍可能进入“浏览器安全验证”
+- 只有验证态，没有有效登录态：搜索可能不再 challenge，但会落到 `nologin`
+
+当前插件的处理链路是：
+
+1. 登录 / 重登成功后，导出整套 Cookie 快照并保存到用户文件
+2. 搜索过程中如果 challenge 求解成功，服务端补发的 `browser_verified` 会进入 scraper 的 cookie jar
+3. 单次搜索成功后，插件会把 scraper 中最新 Cookie 再次导出并回写到用户文件
+4. 插件重启后，优先使用已保存 Cookie 恢复 scraper 会话；只有恢复失败时才回退到用户名密码重新登录
+
+这样做的目的，是尽量复用已经通过的浏览器验证结果，减少不必要的重复 challenge。
 
 ## 4. 搜索页 HTML 结构
 
 ### 搜索地址
 
 ```text
-GET {baseURL}/s/1---1/{url.QueryEscape(keyword)}
+GET {baseURL}/search?q={url.QueryEscape(keyword)}&type=&mode=1
 ```
 
 返回值不是纯 JSON，而是一个 HTML 页面。真正的数据被嵌在 JavaScript 变量里：
@@ -438,11 +465,12 @@ gying-{resourceType}-{resourceID}
 2. 读取插件内关键词缓存
 3. 获取全部活跃用户
 4. 为每个用户取 scraper，没有 scraper 时用已保存 Cookie 恢复
-5. 请求搜索页，提取 `_obj.search`
+5. 请求搜索页；如果遇到浏览器验证页则自动求解后重试
 6. 再访问一次预热详情页刷新反爬 Cookie
-7. 并发拉取详情接口
-8. 构造结果和链接
-9. 聚合多用户结果并按 `UniqueID` 去重
+7. 提取 `_obj.search`
+8. 并发拉取详情接口
+9. 构造结果和链接
+10. 聚合多用户结果并按 `UniqueID` 去重
 
 其中并发限制由两个常量控制：
 

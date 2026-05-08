@@ -16,10 +16,12 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -624,7 +626,7 @@ func (p *GyingPlugin) setBaseURL(baseURL string) {
 }
 
 func (p *GyingPlugin) getLoginPageURL() string {
-	return p.getBaseURL() + "/user/login/"
+	return p.getBaseURL()
 }
 
 func (p *GyingPlugin) getLoginAPIURL() string {
@@ -853,8 +855,8 @@ func (p *GyingPlugin) SearchWithResult(keyword string, ext map[string]interface{
 
 // ============ 用户管理 ============
 
-// loadAllUsers 加载所有用户到内存（包括用户名、加密密码等）
-// 注意：只加载用户数据，scraper实例将在initDefaultAccounts中使用密码重新登录获取
+// loadAllUsers 加载所有用户到内存（包括用户名、加密密码、cookie快照等）
+// scraper实例会在初始化阶段优先用已保存的cookie恢复，失败后再回退到密码重登。
 func (p *GyingPlugin) loadAllUsers() {
 	files, err := ioutil.ReadDir(StorageDir)
 	if err != nil {
@@ -911,7 +913,7 @@ func (p *GyingPlugin) loadAllUsers() {
 }
 
 // initDefaultAccounts 初始化所有账户（异步执行，不阻塞启动）
-// 包括：1. DefaultAccounts（代码配置）  2. 从文件加载的用户（使用加密密码重新登录）
+// 包括：1. DefaultAccounts（代码配置）  2. 从文件加载的用户（优先恢复cookie会话，失败后再使用加密密码重新登录）
 func (p *GyingPlugin) initDefaultAccounts() {
 	// fmt.Printf("[Gying] ========== 异步初始化所有账户 ==========\n")
 
@@ -968,6 +970,23 @@ func (p *GyingPlugin) initOrRestoreUser(username, password, source string) {
 			fmt.Printf("[Gying] 用户 %s scraper已存在，跳过\n", username)
 		}
 		return
+	}
+
+	if existingUser, exists := p.getUserByHash(hash); exists && existingUser.Cookie != "" {
+		scraper, err := p.createScraperWithCookies(existingUser.Cookie)
+		if err == nil {
+			existingUser.LastAccessAt = time.Now()
+			p.scrapers.Store(hash, scraper)
+			if err := p.saveUser(existingUser); err != nil && DebugLog {
+				fmt.Printf("[Gying] ⚠️  恢复用户 %s cookie会话后保存失败: %v\n", username, err)
+			}
+			fmt.Printf("[Gying] ✅ 账户 %s 会话恢复成功 (来源:%s, 使用已保存cookie)\n", username, source)
+			return
+		}
+
+		if DebugLog {
+			fmt.Printf("[Gying] ⚠️  账户 %s cookie会话恢复失败，回退到密码登录: %v\n", username, err)
+		}
 	}
 
 	// 登录
@@ -1028,6 +1047,24 @@ func (p *GyingPlugin) getUserByHash(hash string) (*User, bool) {
 func (p *GyingPlugin) saveUser(user *User) error {
 	p.users.Store(user.Hash, user)
 	return p.persistUser(user)
+}
+
+func (p *GyingPlugin) syncUserCookiesFromScraper(user *User, scraper *cloudscraper.Scraper) error {
+	if user == nil || scraper == nil {
+		return nil
+	}
+
+	cookieStr, err := p.exportCookies(scraper, p.getBaseURL())
+	if err != nil {
+		return err
+	}
+	if cookieStr == "" || cookieStr == user.Cookie {
+		return nil
+	}
+
+	user.Cookie = cookieStr
+	user.LastAccessAt = time.Now()
+	return p.saveUser(user)
 }
 
 // persistUser 持久化用户到文件
@@ -1421,7 +1458,14 @@ func isBotChallengePage(body []byte) bool {
 		return false
 	}
 	bodyText := string(body)
-	return strings.Contains(bodyText, "正在确认你是不是机器人") && challengeJSONPattern.Match(body)
+	if !challengeJSONPattern.Match(body) {
+		return false
+	}
+
+	return strings.Contains(bodyText, "正在确认你是不是机器人") ||
+		strings.Contains(bodyText, "浏览器安全验证") ||
+		strings.Contains(bodyText, "安全验证") ||
+		strings.Contains(bodyText, "正在进行浏览器计算验证")
 }
 
 func isLoginShell(body []byte) bool {
@@ -1429,7 +1473,11 @@ func isLoginShell(body []byte) bool {
 		return false
 	}
 	bodyText := string(body)
-	return strings.Contains(bodyText, "_BT.PC.HTML('login')") || strings.Contains(bodyText, `_BT.PC.HTML("login")`)
+	return strings.Contains(bodyText, "_BT.PC.HTML('login')") ||
+		strings.Contains(bodyText, `_BT.PC.HTML("login")`) ||
+		strings.Contains(bodyText, "_BT.PC.HTML('nologin')") ||
+		strings.Contains(bodyText, `_BT.PC.HTML("nologin")`) ||
+		strings.Contains(bodyText, "未登录，访问受限")
 }
 
 func (p *GyingPlugin) exportCookies(scraper *cloudscraper.Scraper, rawURL string) (string, error) {
@@ -1517,23 +1565,76 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 		return fmt.Errorf("验证数据无效")
 	}
 
-	remaining := make(map[string]int, len(challenge.Challenge))
+	remaining := make(map[string][]int, len(challenge.Challenge))
 	nonces := make([]int, len(challenge.Challenge))
 	for idx, target := range challenge.Challenge {
-		remaining[strings.ToLower(target)] = idx
+		hash := strings.ToLower(target)
+		remaining[hash] = append(remaining[hash], idx)
 	}
 
-	for nonce := 0; nonce <= challenge.Diff && len(remaining) > 0; nonce++ {
-		sum := sha256.Sum256([]byte(strconv.Itoa(nonce) + challenge.Salt))
-		hash := hex.EncodeToString(sum[:])
-		if idx, ok := remaining[hash]; ok {
-			nonces[idx] = nonce
-			delete(remaining, hash)
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if maxWorkers := challenge.Diff + 1; workerCount > maxWorkers {
+		workerCount = maxWorkers
+	}
+
+	var (
+		mu         sync.Mutex
+		solved     atomic.Int32
+		targetsLen = int32(len(challenge.Challenge))
+		wg         sync.WaitGroup
+		saltBytes  = []byte(challenge.Salt)
+	)
+
+	for workerID := 0; workerID < workerCount; workerID++ {
+		wg.Add(1)
+		go func(start int) {
+			defer wg.Done()
+
+			hashInput := make([]byte, 0, len(saltBytes)+20)
+			for nonce := start; nonce <= challenge.Diff; nonce += workerCount {
+				if solved.Load() >= targetsLen {
+					return
+				}
+
+				hashInput = strconv.AppendInt(hashInput[:0], int64(nonce), 10)
+				hashInput = append(hashInput, saltBytes...)
+
+				sum := sha256.Sum256(hashInput)
+				hash := hex.EncodeToString(sum[:])
+
+				mu.Lock()
+				indexes := remaining[hash]
+				if len(indexes) > 0 {
+					idx := indexes[0]
+					nonces[idx] = nonce
+					solved.Add(1)
+					if len(indexes) == 1 {
+						delete(remaining, hash)
+					} else {
+						remaining[hash] = indexes[1:]
+					}
+					if solved.Load() >= targetsLen {
+						mu.Unlock()
+						return
+					}
+				}
+				mu.Unlock()
+			}
+		}(workerID)
+	}
+
+	wg.Wait()
+
+	if solved.Load() != targetsLen {
+		mu.Lock()
+		missing := len(remaining)
+		mu.Unlock()
+		if missing > 0 {
+			return fmt.Errorf("无法完成机器人验证")
 		}
-	}
-
-	if len(remaining) > 0 {
-		return fmt.Errorf("无法完成机器人验证")
 	}
 
 	form := url.Values{}
@@ -1761,6 +1862,7 @@ func (p *GyingPlugin) doLogin(username, password string) (*cloudscraper.Scraper,
 	}
 
 	_, statusCode, headers, err := p.requestWithChallengeRetry(scraper, http.MethodGet, loginPageURL, "", "")
+
 	if err != nil {
 		if DebugLog {
 			fmt.Printf("[Gying] 访问登录页面失败: %v\n", err)
@@ -2025,6 +2127,11 @@ func (p *GyingPlugin) executeSearchTasks(users []*User, keyword string) []model.
 // searchWithScraperWithRetry 使用scraper搜索（带403自动重新登录重试）
 func (p *GyingPlugin) searchWithScraperWithRetry(keyword string, scraper *cloudscraper.Scraper, user *User) ([]model.SearchResult, error) {
 	results, err := p.searchWithScraper(keyword, scraper)
+	if err == nil {
+		if syncErr := p.syncUserCookiesFromScraper(user, scraper); syncErr != nil && DebugLog {
+			fmt.Printf("[Gying] ⚠️  搜索后同步用户 %s Cookie失败: %v\n", user.Username, syncErr)
+		}
+	}
 
 	// 检测是否为403错误
 	if err != nil && strings.Contains(err.Error(), "403") {
@@ -2059,6 +2166,9 @@ func (p *GyingPlugin) searchWithScraperWithRetry(keyword string, scraper *clouds
 		if err != nil {
 			return nil, fmt.Errorf("重新登录后搜索仍然失败: %w", err)
 		}
+		if syncErr := p.syncUserCookiesFromScraper(user, newScraper); syncErr != nil && DebugLog {
+			fmt.Printf("[Gying] ⚠️  重登搜索后同步用户 %s Cookie失败: %v\n", user.Username, syncErr)
+		}
 	}
 
 	return results, err
@@ -2072,7 +2182,8 @@ func (p *GyingPlugin) searchWithScraper(keyword string, scraper *cloudscraper.Sc
 	}
 
 	// 1. 使用cloudscraper请求搜索页面
-	searchURL := fmt.Sprintf("%s/s/1---1/%s", p.getBaseURL(), url.QueryEscape(keyword))
+	// searchURL := fmt.Sprintf("%s/s/1---1/%s", p.getBaseURL(), url.QueryEscape(keyword))
+	searchURL := fmt.Sprintf("%s/search?q=%s&type=&mode=1", p.getBaseURL(), url.QueryEscape(keyword))
 
 	if DebugLog {
 		fmt.Printf("[Gying] 搜索URL: %s\n", searchURL)
