@@ -1,6 +1,7 @@
 package gying
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,9 +29,11 @@ import (
 
 	"pansou/model"
 	"pansou/plugin"
+	"pansou/config"
 	"pansou/util/json"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/proxy"
 
 	cloudscraper "github.com/Advik-B/cloudscraper/lib"
 )
@@ -38,7 +42,7 @@ import (
 const (
 	MaxConcurrentUsers   = 10    // 最多使用的用户数
 	MaxConcurrentDetails = 50    // 最大并发详情请求数
-	DebugLog             = false // 调试日志开关（排查问题时改为true）
+	DebugLog             = true // 调试日志开关（排查问题时改为true）
 )
 
 // 默认账户配置（可通过Web界面添加更多账户）
@@ -532,10 +536,10 @@ type DetailData struct {
 			M []string `json:"m"` // 磁力hash
 			T []string `json:"t"` // 资源名称
 			S []string `json:"s"` // 文件大小
-			E []int    `json:"e"`
+			E []interface{} `json:"e"`
 			P []string `json:"p"` // 资源分组标识
 			U []string `json:"u"`
-			K []int    `json:"k"`
+			K []interface{} `json:"k"`
 			N []string `json:"n"` // 更新时间
 		} `json:"list"`
 	} `json:"downlist"`
@@ -1551,6 +1555,64 @@ func logSetCookiesForDebug(headers http.Header, prefix string, maxLen int) {
 	}
 }
 
+func (p *GyingPlugin) applyProxyToScraper(scraper *cloudscraper.Scraper) error {
+	if scraper == nil {
+		return fmt.Errorf("scraper 实例为空")
+	}
+	if config.AppConfig == nil || strings.TrimSpace(config.AppConfig.ProxyURL) == "" {
+		return nil
+	}
+
+	client, err := getScraperClient(scraper)
+	if err != nil {
+		return err
+	}
+	if client.Transport == nil {
+		return fmt.Errorf("scraper transport 为空")
+	}
+
+	transportValue := reflect.ValueOf(client.Transport)
+	if transportValue.Kind() != reflect.Ptr || transportValue.IsNil() {
+		return fmt.Errorf("scraper transport 无效")
+	}
+
+	transportElem := transportValue.Elem()
+	baseTransportField := transportElem.FieldByName("Transport")
+	if !baseTransportField.IsValid() || baseTransportField.IsNil() {
+		return fmt.Errorf("未找到底层 transport")
+	}
+
+	baseTransportValue := reflect.NewAt(baseTransportField.Type(), unsafe.Pointer(baseTransportField.UnsafeAddr())).Elem()
+	baseTransport, ok := baseTransportValue.Interface().(*http.Transport)
+	if !ok || baseTransport == nil {
+		return fmt.Errorf("底层 transport 无效")
+	}
+
+	proxyURL, err := url.Parse(config.AppConfig.ProxyURL)
+	if err != nil {
+		return fmt.Errorf("解析代理地址失败: %w", err)
+	}
+
+	if proxyURL.Scheme == "socks5" {
+		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+		if err != nil {
+			return fmt.Errorf("创建SOCKS5代理失败: %w", err)
+		}
+		baseTransport.Proxy = nil
+		baseTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.Dial(network, addr)
+		}
+	} else {
+		baseTransport.Proxy = http.ProxyURL(proxyURL)
+	}
+
+	if DebugLog {
+		fmt.Printf("[Gying] 已应用代理到scraper: %s\n", config.AppConfig.ProxyURL)
+	}
+
+	return nil
+}
+
 func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestURL string, body []byte) error {
 	matches := challengeJSONPattern.FindSubmatch(body)
 	if len(matches) < 2 {
@@ -1563,6 +1625,11 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 	}
 	if challenge.ID == "" || challenge.Salt == "" || challenge.Diff <= 0 || len(challenge.Challenge) == 0 {
 		return fmt.Errorf("验证数据无效")
+	}
+
+	if DebugLog {
+		fmt.Printf("[Gying] Challenge命中: url=%s id=%s diff=%d targets=%d\n",
+			requestURL, challenge.ID, challenge.Diff, len(challenge.Challenge))
 	}
 
 	remaining := make(map[string][]int, len(challenge.Challenge))
@@ -1650,6 +1717,10 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 	}
 	defer resp.Body.Close()
 
+	if DebugLog {
+		fmt.Printf("[Gying] Challenge提交完成: url=%s status=%d\n", requestURL, resp.StatusCode)
+	}
+
 	respBody, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("读取验证响应失败: %w", err)
@@ -1669,10 +1740,19 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 		return fmt.Errorf("机器人验证失败")
 	}
 
+	if DebugLog {
+		fmt.Printf("[Gying] Challenge验证成功: url=%s\n", requestURL)
+	}
+
 	return nil
 }
 
 func (p *GyingPlugin) requestWithChallengeRetry(scraper *cloudscraper.Scraper, method, requestURL, contentType, requestBody string) ([]byte, int, http.Header, error) {
+	client, err := getScraperClient(scraper)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+
 	for attempt := 0; attempt < 2; attempt++ {
 		var (
 			resp *http.Response
@@ -1681,7 +1761,11 @@ func (p *GyingPlugin) requestWithChallengeRetry(scraper *cloudscraper.Scraper, m
 
 		switch method {
 		case http.MethodGet:
-			resp, err = scraper.Get(requestURL)
+			var req *http.Request
+			req, err = http.NewRequest(http.MethodGet, requestURL, nil)
+			if err == nil {
+				resp, err = client.Do(req)
+			}
 		case http.MethodPost:
 			resp, err = scraper.Post(requestURL, contentType, strings.NewReader(requestBody))
 		default:
@@ -1699,12 +1783,23 @@ func (p *GyingPlugin) requestWithChallengeRetry(scraper *cloudscraper.Scraper, m
 			return nil, statusCode, headers, readErr
 		}
 
+		if DebugLog {
+			fmt.Printf("[Gying] requestWithChallengeRetry: method=%s attempt=%d status=%d url=%s bodyLen=%d challenge=%v loginShell=%v\n",
+				method, attempt+1, statusCode, requestURL, len(body), isBotChallengePage(body), isLoginShell(body))
+		}
+
 		if isBotChallengePage(body) {
 			if attempt == 1 {
 				return nil, statusCode, headers, fmt.Errorf("重试后仍然进入机器人验证页")
 			}
+			if DebugLog {
+				fmt.Printf("[Gying] requestWithChallengeRetry: 准备求解challenge并重试 url=%s\n", requestURL)
+			}
 			if err := p.solveBotChallenge(scraper, requestURL, body); err != nil {
 				return nil, statusCode, headers, err
+			}
+			if DebugLog {
+				fmt.Printf("[Gying] requestWithChallengeRetry: challenge已完成，重试原请求 url=%s\n", requestURL)
 			}
 			continue
 		}
@@ -1729,6 +1824,9 @@ func (p *GyingPlugin) createScraperWithCookies(cookieStr string) (*cloudscraper.
 	)
 	if err != nil {
 		return nil, fmt.Errorf("创建cloudscraper失败: %w", err)
+	}
+	if err := p.applyProxyToScraper(scraper); err != nil {
+		return nil, fmt.Errorf("应用代理失败: %w", err)
 	}
 
 	// 如果有保存的cookies，使用反射设置到scraper的内部http.Client
@@ -1846,6 +1944,12 @@ func (p *GyingPlugin) doLogin(username, password string) (*cloudscraper.Scraper,
 			fmt.Printf("[Gying] 创建cloudscraper失败: %v\n", err)
 		}
 		return nil, "", fmt.Errorf("创建cloudscraper失败: %w", err)
+	}
+	if err := p.applyProxyToScraper(scraper); err != nil {
+		if DebugLog {
+			fmt.Printf("[Gying] 应用代理失败: %v\n", err)
+		}
+		return nil, "", fmt.Errorf("应用代理失败: %w", err)
 	}
 
 	if DebugLog {
@@ -2183,7 +2287,7 @@ func (p *GyingPlugin) searchWithScraper(keyword string, scraper *cloudscraper.Sc
 
 	// 1. 使用cloudscraper请求搜索页面
 	// searchURL := fmt.Sprintf("%s/s/1---1/%s", p.getBaseURL(), url.QueryEscape(keyword))
-	searchURL := fmt.Sprintf("%s/search?q=%s&type=&mode=1", p.getBaseURL(), url.QueryEscape(keyword))
+	searchURL := fmt.Sprintf("%s/search?q=%s&type=0&mode=2", p.getBaseURL(), url.QueryEscape(keyword))
 
 	if DebugLog {
 		fmt.Printf("[Gying] 搜索URL: %s\n", searchURL)

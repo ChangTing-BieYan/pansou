@@ -60,7 +60,7 @@ http://localhost:8888/gying/myusername
 - 默认站点地址为 `https://www.gying.net`
 - 初始会话页：`{base_url}`
 - 登录接口：`{base_url}/user/login`
-- 搜索页：`{base_url}/search?q={keyword}&type=&mode=1`
+- 搜索页：`{base_url}/search?q={keyword}&type=0&mode=2`
 - 详情接口：`{base_url}/res/downurl/{type}/{id}`
 
 也就是说，插件不是固定写死抓某一个域名，而是所有核心请求都基于当前 `base_url` 动态拼接。
@@ -326,10 +326,31 @@ curl -X POST "http://localhost:8888/gying/{hash}" \
 
 当前搜索逻辑不是直接调一个公开 API，而是：
 
-1. 访问搜索页 `/{base_url}/search?q={keyword}&type=&mode=1`
+1. 访问搜索页 `/{base_url}/search?q={keyword}&type=0&mode=2`
 2. 从 HTML 中提取 `_obj.search = {...}` 内嵌 JSON
 3. 再并发请求详情接口 `/{base_url}/res/downurl/{type}/{id}`
 4. 从详情里提取网盘链接和磁力链接
+
+### 2.1 代理前提
+
+当前目标站点在不同网络出口下行为差异很大。
+
+实测中，如果直连当前 `gying` 域名，搜索入口有时不会进入 challenge，而是直接返回一个由 `Angie` 输出的 `404 Not Found` 假页；这类 404 不是插件参数错误，而是站点对当前网络出口的拒绝或伪装响应。
+
+因此，`gying` 在需要海外网络时，必须确保插件自己的请求链也走代理。
+
+当前实现会显式复用主程序的全局 `PROXY` 配置，并应用到 `cloudscraper` 内部 transport，包括：
+
+- 启动时使用已保存 Cookie 恢复会话
+- 用户名密码登录
+- 搜索页请求
+- 详情接口请求
+
+例如：
+
+```bash
+PROXY=socks5://127.0.0.1:7897 ENABLED_PLUGINS=gying go run .
+```
 
 ### 3. 自动重新登录
 
@@ -391,6 +412,9 @@ curl -X POST "http://localhost:8888/gying/{hash}" \
 ```bash
 # 缓存目录（默认 ./cache）
 export CACHE_PATH="./cache"
+
+# 目标站点如果需要海外网络，建议显式配置 PROXY；gying 会复用这条代理到自己的 cloudscraper 请求链
+export PROXY="socks5://127.0.0.1:7897"
 
 # Hash Salt（推荐自定义，增强安全性）
 export GYING_HASH_SALT="your-custom-salt-here"

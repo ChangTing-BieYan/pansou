@@ -34,7 +34,7 @@ https://www.gying.net
 | --- | --- |
 | 登录页 / 初始会话页 | `{baseURL}` |
 | 登录接口 | `{baseURL}/user/login` |
-| 搜索页 | `{baseURL}/search?q={keyword}&type=&mode=1` |
+| 搜索页 | `{baseURL}/search?q={keyword}&type=0&mode=2` |
 | 详情接口 | `{baseURL}/res/downurl/{type}/{id}` |
 | 预热详情页 | `{baseURL}/mv/wkMn` |
 
@@ -54,7 +54,7 @@ https://www.gying.net
 搜索与详情请求也不是写死域名，而是分别拼接为：
 
 ```text
-{baseURL}/search?q={keyword}&type=&mode=1
+{baseURL}/search?q={keyword}&type=0&mode=2
 {baseURL}/res/downurl/{type}/{id}
 ```
 
@@ -205,12 +205,37 @@ GET {baseURL}/mv/wkMn
 
 这样做的目的，是尽量复用已经通过的浏览器验证结果，减少不必要的重复 challenge。
 
+### 代理前提
+
+当前目标站点对网络出口非常敏感。
+
+实测里，同一个 `/search` 地址在不同请求链上可能出现两种完全不同的表现：
+
+- 可访问网络出口：先返回 challenge，再返回 `_obj.search`
+- 受限网络出口：直接返回由 `Angie` 输出的 `404 Not Found` 假页
+
+也就是说，这类 404 不能直接解释为“搜索参数错误”或“路由不存在”，它很可能只是站点对当前网络出口的伪装拒绝。
+
+为了解决这一点，当前 `gying` 会显式把主程序的 `PROXY` 配置应用到 `cloudscraper` 内部 transport，而不是只依赖库默认行为。
+
+当前代理应用点包括：
+
+1. `doLogin()` 创建 scraper 时
+2. `createScraperWithCookies()` 恢复 scraper 时
+3. 随后的搜索页、详情页、challenge 提交请求
+
+支持的代理类型与主程序一致：
+
+- `socks5://...`
+- `http://...`
+- `https://...`
+
 ## 4. 搜索页 HTML 结构
 
 ### 搜索地址
 
 ```text
-GET {baseURL}/search?q={url.QueryEscape(keyword)}&type=&mode=1
+GET {baseURL}/search?q={url.QueryEscape(keyword)}&type=0&mode=2
 ```
 
 返回值不是纯 JSON，而是一个 HTML 页面。真正的数据被嵌在 JavaScript 变量里：
@@ -297,14 +322,14 @@ type DetailData struct {
         } `json:"type"`
         Hex  string `json:"hex"`
         List struct {
-            M []string `json:"m"`
-            T []string `json:"t"`
-            S []string `json:"s"`
-            E []int    `json:"e"`
-            P []string `json:"p"`
-            U []string `json:"u"`
-            K []int    `json:"k"`
-            N []string `json:"n"`
+            M []string      `json:"m"`
+            T []string      `json:"t"`
+            S []string      `json:"s"`
+            E []interface{} `json:"e"`
+            P []string      `json:"p"`
+            U []string      `json:"u"`
+            K []interface{} `json:"k"`
+            N []string      `json:"n"`
         } `json:"list"`
     } `json:"downlist"`
     Panlist struct {
@@ -335,6 +360,23 @@ type DetailData struct {
 | `downlist.list.t` | 资源名 | 作为 magnet `dn` |
 | `downlist.list.s` | 文件大小 | 资源名兜底 |
 | `downlist.list.n` | 更新时间 | 链接时间、结果时间 |
+
+### 结构兼容性说明
+
+当前站点的详情 JSON 并不是所有字段都严格稳定。
+
+实测里，`downlist.list.e` 和 `downlist.list.k` 可能混用：
+
+- `int`
+- `string`
+
+例如某些条目会返回：
+
+- `e: [1, 0, 0, 9, 0]`
+- `e: ["-1"]`
+- `e: [0, 10, "-1", "-1"]`
+
+因此当前实现把这两个字段按宽松类型接收，避免因为单个字段的类型漂移导致整条详情 JSON 反序列化失败。
 
 ## 6. SearchResult 映射逻辑
 

@@ -77,6 +77,7 @@ import (
 	_ "pansou/plugin/panyq"
 	_ "pansou/plugin/pianku"
 	_ "pansou/plugin/qingying"
+	_ "pansou/plugin/qiwei"
 	_ "pansou/plugin/qqpd"
 	_ "pansou/plugin/quark4k"
 	_ "pansou/plugin/quarksoo"
@@ -110,8 +111,8 @@ import (
 	_ "pansou/plugin/duanjuw"
 	_ "pansou/plugin/jupansou"
 	_ "pansou/plugin/lingjisp"
-	_ "pansou/plugin/quarktv"
 	_ "pansou/plugin/panzun"
+	_ "pansou/plugin/quarktv"
 )
 
 // 全局缓存写入管理器
