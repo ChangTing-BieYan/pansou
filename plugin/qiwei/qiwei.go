@@ -126,6 +126,8 @@ func (p *QiweiPlugin) searchImpl(client *http.Client, keyword string, ext map[st
 		client = p.client
 	}
 
+	forceRefresh := shouldForceRefresh(ext)
+
 	items, host, err := p.searchSuggestWithFallback(client, keyword)
 	if err != nil {
 		return nil, err
@@ -144,7 +146,7 @@ func (p *QiweiPlugin) searchImpl(client *http.Client, keyword string, ext map[st
 		return len(items[i].Name) < len(items[j].Name)
 	})
 
-	results := p.enrichResults(client, host, items)
+	results := p.enrichResults(client, host, items, forceRefresh)
 	if len(results) == 0 {
 		return []model.SearchResult{}, nil
 	}
@@ -191,7 +193,7 @@ func (p *QiweiPlugin) searchSuggest(client *http.Client, host, keyword string) (
 	return resp.List, nil
 }
 
-func (p *QiweiPlugin) enrichResults(client *http.Client, host string, items []suggestItem) []model.SearchResult {
+func (p *QiweiPlugin) enrichResults(client *http.Client, host string, items []suggestItem, forceRefresh bool) []model.SearchResult {
 	results := make([]model.SearchResult, len(items))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, maxConcurrent)
@@ -203,7 +205,7 @@ func (p *QiweiPlugin) enrichResults(client *http.Client, host string, items []su
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			results[idx] = p.buildResult(client, host, it)
+			results[idx] = p.buildResult(client, host, it, forceRefresh)
 		}(i, item)
 	}
 
@@ -218,7 +220,7 @@ func (p *QiweiPlugin) enrichResults(client *http.Client, host string, items []su
 	return finalResults
 }
 
-func (p *QiweiPlugin) buildResult(client *http.Client, host string, item suggestItem) model.SearchResult {
+func (p *QiweiPlugin) buildResult(client *http.Client, host string, item suggestItem, forceRefresh bool) model.SearchResult {
 	detailURL := fmt.Sprintf("%s/mv/%d.html", host, item.ID)
 	baseTitle := cleanText(item.Name)
 	cover := normalizeURL(detailURL, item.Pic)
@@ -241,7 +243,7 @@ func (p *QiweiPlugin) buildResult(client *http.Client, host string, item suggest
 		result.Images = []string{cover}
 	}
 
-	info, err := p.getDetailInfo(client, detailURL, baseTitle, cover)
+	info, err := p.getDetailInfo(client, detailURL, baseTitle, cover, forceRefresh)
 	if err != nil {
 		return result
 	}
@@ -268,8 +270,10 @@ func (p *QiweiPlugin) buildResult(client *http.Client, host string, item suggest
 	return result
 }
 
-func (p *QiweiPlugin) getDetailInfo(client *http.Client, detailURL, fallbackTitle, fallbackPic string) (detailInfo, error) {
-	if cached, ok := p.detailCache.Load(detailURL); ok {
+func (p *QiweiPlugin) getDetailInfo(client *http.Client, detailURL, fallbackTitle, fallbackPic string, forceRefresh bool) (detailInfo, error) {
+	if forceRefresh {
+		p.detailCache.Delete(detailURL)
+	} else if cached, ok := p.detailCache.Load(detailURL); ok {
 		if entry, ok := cached.(detailCacheEntry); ok {
 			if time.Since(entry.CachedAt) < cacheTTL {
 				return entry.Info, nil
@@ -525,7 +529,7 @@ func (p *QiweiPlugin) fetchBody(client *http.Client, requestURL, referer string,
 		return "", fmt.Errorf("[%s] 读取响应失败: %w", p.Name(), err)
 	}
 
-	return string(body), nil
+	return normalizeResponseBody(string(body)), nil
 }
 
 func (p *QiweiPlugin) doRequestWithRetry(req *http.Request, client *http.Client) (*http.Response, error) {
@@ -628,8 +632,10 @@ func determineCloudType(link string) string {
 		return "tianyi"
 	case strings.Contains(lower, "115.com") || strings.Contains(lower, "115cdn.com") || strings.Contains(lower, "anxia.com"):
 		return "115"
-	case strings.Contains(lower, "123684.com") || strings.Contains(lower, "123685.com") || strings.Contains(lower, "123912.com") || strings.Contains(lower, "123pan.com") || strings.Contains(lower, "123pan.cn") || strings.Contains(lower, "123592.com"):
+	case strings.Contains(lower, "123684.com") || strings.Contains(lower, "123685.com") || strings.Contains(lower, "123912.com") || strings.Contains(lower, "123865.com") || strings.Contains(lower, "123pan.com") || strings.Contains(lower, "123pan.cn") || strings.Contains(lower, "123592.com"):
 		return "123"
+	case strings.Contains(lower, "content.21cn.com"):
+		return "tianyi"
 	case strings.Contains(lower, "caiyun.139.com"):
 		return "mobile"
 	case strings.Contains(lower, "mypikpak.com"):
@@ -712,7 +718,7 @@ func extractUpdateTime(text string) time.Time {
 }
 
 func normalizeURL(baseURL, raw string) string {
-	raw = strings.TrimSpace(htmlEntityDecode(raw))
+	raw = strings.TrimSpace(cleanInvisibleRunes(htmlEntityDecode(raw)))
 	if raw == "" {
 		return ""
 	}
@@ -759,6 +765,54 @@ func htmlEntityDecode(s string) string {
 		"&gt;", ">",
 	)
 	return replacer.Replace(s)
+}
+
+func normalizeResponseBody(body string) string {
+	trimmed := strings.TrimSpace(body)
+	if len(trimmed) >= 2 && trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"' {
+		var decoded string
+		if err := json.Unmarshal([]byte(trimmed), &decoded); err == nil {
+			decoded = strings.TrimSpace(decoded)
+			if strings.Contains(decoded, "<html") || strings.Contains(decoded, "<!DOCTYPE html") {
+				return decoded
+			}
+		}
+	}
+	return body
+}
+
+func cleanInvisibleRunes(s string) string {
+	replacer := strings.NewReplacer(
+		"\u200b", "",
+		"\u200c", "",
+		"\u200d", "",
+		"\ufeff", "",
+	)
+	return replacer.Replace(s)
+}
+
+func shouldForceRefresh(ext map[string]interface{}) bool {
+	if ext == nil {
+		return false
+	}
+	value, ok := ext["refresh"]
+	if !ok {
+		return false
+	}
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true") || strings.TrimSpace(v) == "1"
+	case int:
+		return v != 0
+	case int64:
+		return v != 0
+	case float64:
+		return v != 0
+	default:
+		return false
+	}
 }
 
 func attrOrEmpty(s *goquery.Selection, name string) string {
