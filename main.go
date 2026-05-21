@@ -62,7 +62,6 @@ import (
 	_ "pansou/plugin/libvio"
 	_ "pansou/plugin/lou1"
 	_ "pansou/plugin/meitizy"
-	_ "pansou/plugin/melost"
 	_ "pansou/plugin/miaoso"
 	_ "pansou/plugin/mikuclub"
 	_ "pansou/plugin/mizixing"
@@ -105,8 +104,8 @@ import (
 	_ "pansou/plugin/ypfxw"
 	_ "pansou/plugin/yuhuage"
 	_ "pansou/plugin/yulinshufa"
-	_ "pansou/plugin/yunso"
 	_ "pansou/plugin/yunsou"
+	_ "pansou/plugin/melost"
 	_ "pansou/plugin/zhizhen"
 	_ "pansou/plugin/zxzj"
 
@@ -115,6 +114,7 @@ import (
 	_ "pansou/plugin/lingjisp"
 	_ "pansou/plugin/panzun"
 	_ "pansou/plugin/quarktv"
+    _ "pansou/plugin/yunso"
 )
 
 // 全局缓存写入管理器

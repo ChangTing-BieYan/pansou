@@ -23,8 +23,8 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"pansou/model"
-	utiljson "pansou/util/json"
 	"pansou/util"
+	utiljson "pansou/util/json"
 )
 
 const (
@@ -237,18 +237,47 @@ func (s *CheckService) checkAliyun(item model.CheckItem, normalized string) (mod
 	}
 
 	var parsed struct {
-		ShareName  string `json:"share_name"`
-		ShareTitle string `json:"share_title"`
-		Code       string `json:"code"`
-		Message    string `json:"message"`
+		ShareName   string `json:"share_name"`
+		ShareTitle  string `json:"share_title"`
+		Code        string `json:"code"`
+		Message     string `json:"message"`
+		FileCount   *int   `json:"file_count"`
+		ShareStatus string `json:"share_status"`
 	}
 	_ = utiljson.Unmarshal(body, &parsed)
 
+	code := strings.TrimSpace(parsed.Code)
+	if code != "" {
+		codeLower := strings.ToLower(code)
+		message := coalesce(parsed.Message, code)
+		switch {
+		case strings.Contains(codeLower, "sharelink"):
+			return s.buildResult(item, normalized, checkStateBad, false, message), nil
+		case containsAny(codeLower, []string{"notfound", "cancelled", "canceled", "forbidden", "expired"}):
+			return s.buildResult(item, normalized, checkStateBad, false, message), nil
+		case containsAny(codeLower, []string{"exceed", "frequency", "limit"}):
+			return s.buildResult(item, normalized, checkStateUncertain, false, message), nil
+		default:
+			return s.buildResult(item, normalized, checkStateUncertain, false, message), nil
+		}
+	}
+
+	if parsed.FileCount != nil && *parsed.FileCount == 0 && parsed.ShareName == "" {
+		return s.buildResult(item, normalized, checkStateBad, false, "分享内容为空(file_count=0)"), nil
+	}
+
+	shareStatus := strings.ToLower(strings.TrimSpace(parsed.ShareStatus))
+	if shareStatus != "" && shareStatus != "enabled" && shareStatus != "normal" {
+		if containsAny(shareStatus, []string{"forbidden", "cancel", "expired", "illegal", "invalid", "disabled"}) {
+			return s.buildResult(item, normalized, checkStateBad, false, coalesce(parsed.Message, "链接失效")), nil
+		}
+	}
+
 	switch {
-	case statusCode == http.StatusOK && (parsed.ShareName != "" || parsed.ShareTitle != ""):
+	case statusCode == http.StatusOK && (parsed.ShareName != "" || parsed.ShareTitle != "" || (parsed.FileCount != nil && *parsed.FileCount > 0)):
 		return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
-	case strings.Contains(parsed.Code, "NotFound"), strings.Contains(parsed.Code, "Cancelled"):
-		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
+	case statusCode != http.StatusOK:
+		return s.buildResult(item, normalized, checkStateUncertain, false, coalesce(parsed.Message, fmt.Sprintf("HTTP状态码: %d", statusCode))), nil
 	default:
 		return s.buildResult(item, normalized, checkStateUncertain, false, parsed.Message), nil
 	}
@@ -277,6 +306,7 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string) (mode
 	}
 
 	var tokenResp struct {
+		Status  int    `json:"status"`
 		Code    int    `json:"code"`
 		Message string `json:"message"`
 		Data    struct {
@@ -301,6 +331,10 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string) (mode
 		return s.buildResult(item, normalized, checkStateUncertain, false, tokenResp.Message), nil
 	}
 
+	if tokenResp.Status != 0 && tokenResp.Status != http.StatusOK {
+		return s.buildResult(item, normalized, checkStateBad, false, coalesce(tokenResp.Message, "分享链接失效或不存在")), nil
+	}
+
 	if tokenResp.Data.Stoken == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "访问令牌缺失"), nil
 	}
@@ -317,18 +351,65 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string) (mode
 	}
 
 	var detailResp struct {
-		Code int `json:"code"`
-		Data struct {
-			List []any `json:"list"`
+		Status  int    `json:"status"`
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			List  []any `json:"list"`
+			Share struct {
+				Status           int   `json:"status"`
+				PartialViolation bool  `json:"partial_violation"`
+				ExpiredAt        int64 `json:"expired_at"`
+				ExpiredType      int   `json:"expired_type"`
+			} `json:"share"`
+			IsExpire bool `json:"is_expire"`
 		} `json:"data"`
 	}
 	_ = utiljson.Unmarshal(detailBody, &detailResp)
 
-	if detailResp.Code == 0 && len(detailResp.Data.List) > 0 {
-		return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+	if detailResp.Code != 0 {
+		message := coalesce(detailResp.Message, "无法确认链接状态")
+		messageLower := strings.ToLower(message)
+		switch {
+		case containsAny(messageLower, []string{"提取码", "密码", "passcode"}):
+			return s.buildResult(item, normalized, checkStateLocked, false, message), nil
+		case containsAny(messageLower, []string{"不存在", "失效", "违规", "过期", "取消"}):
+			return s.buildResult(item, normalized, checkStateBad, false, message), nil
+		default:
+			return s.buildResult(item, normalized, checkStateUncertain, false, message), nil
+		}
 	}
 
-	return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
+	share := detailResp.Data.Share
+	if len(detailResp.Data.List) == 0 {
+		switch {
+		case share.Status > 1 && share.PartialViolation:
+			return s.buildResult(item, normalized, checkStateBad, false, fmt.Sprintf("分享链接部分违规已失效(share_status=%d)", share.Status)), nil
+		case share.Status > 1:
+			return s.buildResult(item, normalized, checkStateBad, false, fmt.Sprintf("分享链接已失效(share_status=%d)", share.Status)), nil
+		case detailResp.Data.IsExpire:
+			return s.buildResult(item, normalized, checkStateBad, false, "分享链接已过期"), nil
+		default:
+			return s.buildResult(item, normalized, checkStateBad, false, "分享链接无效：文件列表为空"), nil
+		}
+	}
+
+	switch {
+	case share.Status == 1 && share.PartialViolation:
+		return s.buildResult(item, normalized, checkStateOK, false, "链接有效但部分文件违规"), nil
+	case share.Status == 1:
+		return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+	case share.Status == 3 && share.PartialViolation:
+		return s.buildResult(item, normalized, checkStateBad, false, "分享链接因违规已失效(share_status=3, partial_violation=true)"), nil
+	case share.Status == 3:
+		return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+	case share.Status > 1:
+		return s.buildResult(item, normalized, checkStateBad, false, fmt.Sprintf("分享链接已失效(share_status=%d)", share.Status)), nil
+	case share.PartialViolation:
+		return s.buildResult(item, normalized, checkStateOK, false, "链接有效但部分文件违规"), nil
+	default:
+		return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+	}
 }
 
 func (s *CheckService) checkUC(item model.CheckItem, normalized string) (model.CheckResult, error) {
@@ -497,16 +578,49 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string) (mod
 		Message string   `xml:"message"`
 	}
 	if err := xml.Unmarshal(body, &errorResponse); err == nil && errorResponse.XMLName.Local == "error" {
-		message := coalesce(errorResponse.Message, errorResponse.Code)
-		messageLower := strings.ToLower(message)
+		message := mapTianyiErrorMessage(errorResponse.Code, errorResponse.Message)
+		messageLower := strings.ToLower(coalesce(errorResponse.Code, errorResponse.Message, message))
 
 		switch {
+		case isKnownTianyiErrorCode(errorResponse.Code):
+			return s.buildResult(item, normalized, checkStateBad, false, message), nil
 		case containsAny(messageLower, []string{"accesscode", "访问码", "提取码", "密码"}):
 			return s.buildResult(item, normalized, checkStateLocked, false, message), nil
-		case containsAny(messageLower, []string{"shareinfonotfound", "sharenotfound", "filenotfound", "shareexpirederror", "shareauditnotpass", "不存在", "失效", "取消", "过期"}):
+		case containsAny(messageLower, []string{"shareinfonotfound", "sharenotfound", "filenotfound", "shareexpirederror", "shareauditnotpass", "foldernotfound", "不存在", "失效", "取消", "过期"}):
 			return s.buildResult(item, normalized, checkStateBad, false, message), nil
 		}
 		return s.buildResult(item, normalized, checkStateBad, false, message), nil
+	}
+
+	var jsonResponse struct {
+		ResCode        int    `json:"res_code"`
+		ResMessage     string `json:"res_message"`
+		ErrorCode      string `json:"error_code"`
+		FileName       string `json:"fileName"`
+		NeedAccessCode int    `json:"needAccessCode"`
+		ShareID        int64  `json:"shareId"`
+	}
+	if err := utiljson.Unmarshal(body, &jsonResponse); err == nil {
+		if jsonResponse.ErrorCode == "" {
+			jsonResponse.ErrorCode = scanTianyiKnownErrorCode(bodyText)
+		}
+
+		switch {
+		case jsonResponse.ShareID > 0:
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		case jsonResponse.FileName != "":
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		case jsonResponse.NeedAccessCode == 1:
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		case jsonResponse.ErrorCode != "":
+			return s.buildResult(item, normalized, checkStateBad, false, mapTianyiErrorMessage(jsonResponse.ErrorCode, jsonResponse.ResMessage)), nil
+		case containsAny(strings.ToLower(jsonResponse.ResMessage), []string{"accesscode", "访问码", "提取码", "密码"}):
+			return s.buildResult(item, normalized, checkStateLocked, false, coalesce(jsonResponse.ResMessage, "需要访问码")), nil
+		}
+	}
+
+	if code := scanTianyiKnownErrorCode(bodyText); code != "" {
+		return s.buildResult(item, normalized, checkStateBad, false, mapTianyiErrorMessage(code, "")), nil
 	}
 
 	switch {
@@ -520,7 +634,7 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string) (mod
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
 	case containsAny(strings.ToLower(bodyText), []string{"erroraccesscode", "needaccesscode", "访问码", "提取码", "密码"}):
 		return s.buildResult(item, normalized, checkStateLocked, false, "需要访问码"), nil
-	case containsAny(strings.ToLower(bodyText), []string{"shareinfonotfound", "sharenotfound", "filenotfound", "shareexpirederror", "shareauditnotpass", "不存在", "失效", "取消", "过期"}):
+	case containsAny(strings.ToLower(bodyText), []string{"shareinfonotfound", "sharenotfound", "filenotfound", "shareexpirederror", "shareauditnotpass", "foldernotfound", "不存在", "失效", "取消", "过期"}):
 		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	default:
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
@@ -670,15 +784,15 @@ func (s *CheckService) check115(item model.CheckItem, normalized string) (model.
 		url.QueryEscape(shareCode), url.QueryEscape(password))
 
 	body, _, err := s.doRequest(ctx, "GET", apiURL, nil, map[string]string{
-		"priority":            "u=1, i",
-		"referer":             fmt.Sprintf("https://115cdn.com/s/%s?password=%s&", shareCode, password),
-		"x-requested-with":    "XMLHttpRequest",
-		"sec-ch-ua":           `"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"`,
-		"sec-ch-ua-mobile":    "?0",
-		"sec-ch-ua-platform":  `"Windows"`,
-		"sec-fetch-dest":      "empty",
-		"sec-fetch-mode":      "cors",
-		"sec-fetch-site":      "same-origin",
+		"priority":           "u=1, i",
+		"referer":            fmt.Sprintf("https://115cdn.com/s/%s?password=%s&", shareCode, password),
+		"x-requested-with":   "XMLHttpRequest",
+		"sec-ch-ua":          `"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"`,
+		"sec-ch-ua-mobile":   "?0",
+		"sec-ch-ua-platform": `"Windows"`,
+		"sec-fetch-dest":     "empty",
+		"sec-fetch-mode":     "cors",
+		"sec-fetch-site":     "same-origin",
 	})
 	if err != nil {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "请求失败"), err
@@ -691,7 +805,7 @@ func (s *CheckService) check115(item model.CheckItem, normalized string) (model.
 		Data  struct {
 			List       []any `json:"list"`
 			Count      int   `json:"count"`
-			ShareState int `json:"share_state"`
+			ShareState int   `json:"share_state"`
 			ShareInfo  struct {
 				SnapID       string `json:"snap_id"`
 				ShareTitle   string `json:"share_title"`
@@ -1157,6 +1271,45 @@ func coalesce(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
 			return value
+		}
+	}
+	return ""
+}
+
+func mapTianyiErrorMessage(code string, fallback string) string {
+	switch strings.TrimSpace(code) {
+	case "ShareInfoNotFound":
+		return "分享信息不存在"
+	case "ShareNotFound":
+		return "分享链接不存在"
+	case "FileNotFound":
+		return "分享文件不存在"
+	case "ShareExpiredError":
+		return "分享链接已过期"
+	case "ShareAuditNotPass":
+		return "分享因审核未通过已失效"
+	case "FolderNotFound":
+		return "分享文件夹不存在"
+	default:
+		return coalesce(fallback, code)
+	}
+}
+
+func isKnownTianyiErrorCode(code string) bool {
+	return scanTianyiKnownErrorCode(code) != ""
+}
+
+func scanTianyiKnownErrorCode(content string) string {
+	for _, code := range []string{
+		"ShareInfoNotFound",
+		"ShareNotFound",
+		"FileNotFound",
+		"ShareExpiredError",
+		"ShareAuditNotPass",
+		"FolderNotFound",
+	} {
+		if strings.Contains(content, code) {
+			return code
 		}
 	}
 	return ""
