@@ -322,6 +322,25 @@ curl -X POST "http://localhost:8888/gying/{hash}" \
 
 这一步的目的是尽量复用浏览器验证结果，减少重复触发 challenge。
 
+#### 1.1 2026-05 登录验证循环问题
+
+曾出现过一种登录失败场景：日志里先显示 `Challenge验证成功`，但随后重试原请求仍然返回 `浏览器安全验证`，最终报错 `重试后仍然进入机器人验证页`。
+
+排查结论：新版验证态不只依赖 `browser_verified` Cookie，还会受同一次客户端请求指纹影响。此前 `requestWithChallengeRetry` 里 GET 请求直接使用 cloudscraper 内部的 `http.Client.Do`，而验证提交使用 `scraper.Post`；这会让“访问验证页 / 提交验证 / 重试原请求”没有完整经过 cloudscraper 的同一套浏览器化请求处理，导致站点认为重试请求仍然需要验证。
+
+当前修复：
+
+- GET 请求统一使用 `scraper.Get`
+- POST 请求继续使用 `scraper.Post`
+- challenge 页、验证提交、重试原请求都保持在同一个 cloudscraper 会话与请求链路里
+- 调试日志中的登录 POST 数据已对密码脱敏，只输出密码长度
+
+验证方式：
+
+1. 使用错误密码登录，应能通过 challenge 并返回站点的账号密码错误 JSON，而不是停在机器人验证页。
+2. 使用正确密码登录，应返回 `登录成功`，并在 Cookie 快照中包含 `PHPSESSID`、`app_auth`、`browser_verified`。
+3. 调用 `test_search` 搜索关键词，应能访问搜索页和详情接口并返回网盘链接。
+
 ### 2. 搜索链路不是单接口
 
 当前搜索逻辑不是直接调一个公开 API，而是：

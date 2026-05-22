@@ -27,9 +27,9 @@ import (
 	"time"
 	"unsafe"
 
+	"pansou/config"
 	"pansou/model"
 	"pansou/plugin"
-	"pansou/config"
 	"pansou/util/json"
 
 	"github.com/gin-gonic/gin"
@@ -40,9 +40,9 @@ import (
 
 // 插件配置参数
 const (
-	MaxConcurrentUsers   = 10    // 最多使用的用户数
-	MaxConcurrentDetails = 50    // 最大并发详情请求数
-	DebugLog             = true // 调试日志开关（排查问题时改为true）
+	MaxConcurrentUsers   = 10   // 最多使用的用户数
+	MaxConcurrentDetails = 50   // 最大并发详情请求数
+	DebugLog             = false // 调试日志开关（排查问题时改为true）
 )
 
 // 默认账户配置（可通过Web界面添加更多账户）
@@ -533,14 +533,14 @@ type DetailData struct {
 		} `json:"type"`
 		Hex  string `json:"hex"`
 		List struct {
-			M []string `json:"m"` // 磁力hash
-			T []string `json:"t"` // 资源名称
-			S []string `json:"s"` // 文件大小
+			M []string      `json:"m"` // 磁力hash
+			T []string      `json:"t"` // 资源名称
+			S []string      `json:"s"` // 文件大小
 			E []interface{} `json:"e"`
-			P []string `json:"p"` // 资源分组标识
-			U []string `json:"u"`
+			P []string      `json:"p"` // 资源分组标识
+			U []string      `json:"u"`
 			K []interface{} `json:"k"`
-			N []string `json:"n"` // 更新时间
+			N []string      `json:"n"` // 更新时间
 		} `json:"list"`
 	} `json:"downlist"`
 	Panlist struct {
@@ -1748,11 +1748,6 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 }
 
 func (p *GyingPlugin) requestWithChallengeRetry(scraper *cloudscraper.Scraper, method, requestURL, contentType, requestBody string) ([]byte, int, http.Header, error) {
-	client, err := getScraperClient(scraper)
-	if err != nil {
-		return nil, 0, nil, err
-	}
-
 	for attempt := 0; attempt < 2; attempt++ {
 		var (
 			resp *http.Response
@@ -1761,11 +1756,9 @@ func (p *GyingPlugin) requestWithChallengeRetry(scraper *cloudscraper.Scraper, m
 
 		switch method {
 		case http.MethodGet:
-			var req *http.Request
-			req, err = http.NewRequest(http.MethodGet, requestURL, nil)
-			if err == nil {
-				resp, err = client.Do(req)
-			}
+			// Use cloudscraper for GET as well as POST so the challenge page,
+			// verification request, and retry share the same browser-like headers.
+			resp, err = scraper.Get(requestURL)
 		case http.MethodPost:
 			resp, err = scraper.Post(requestURL, contentType, strings.NewReader(requestBody))
 		default:
@@ -1994,7 +1987,8 @@ func (p *GyingPlugin) doLogin(username, password string) (*cloudscraper.Scraper,
 	if DebugLog {
 		fmt.Printf("[Gying] 步骤2: POST登录\n")
 		fmt.Printf("[Gying] 登录URL: %s\n", loginURL)
-		fmt.Printf("[Gying] POST数据: %s\n", postData)
+		fmt.Printf("[Gying] POST数据: code=&siteid=1&dosubmit=1&cookietime=10506240&username=%s&password=<len:%d>\n",
+			url.QueryEscape(username), len(password))
 	}
 
 	body, statusCode, headers, err := p.requestWithChallengeRetry(scraper, http.MethodPost, loginURL, "application/x-www-form-urlencoded", postData)
