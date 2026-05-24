@@ -83,7 +83,7 @@ const json={...};const jss=
 当前用于提取挑战数据的正则：
 
 ```go
-challengeJSONPattern = regexp.MustCompile(`const json=(\{.*?\});const jss=`)
+challengeJSONPattern = regexp.MustCompile(`(?s)const\s+json\s*=\s*(\{.*?\})\s*;\s*const\s+jss\s*=`)
 ```
 
 ### 挑战数据结构
@@ -96,17 +96,48 @@ type ChallengePageData struct {
     Challenge []string `json:"challenge"`
     Diff      int      `json:"diff"`
     Salt      string   `json:"salt"`
+    N         string   `json:"N"`
+    X         string   `json:"x"`
+    T         int      `json:"t"`
 }
 ```
 
-含义可以理解为：
+当前兼容两套验证字段。
+
+旧版哈希枚举字段含义：
 
 - `id`：本次挑战标识
 - `challenge`：目标哈希列表
 - `diff`：枚举上限
 - `salt`：参与哈希运算的盐值
 
-### 插件求解方式
+新版 PoW 字段含义：
+
+- `id`：本次挑战标识
+- `N`：十六进制大整数模数
+- `x`：十六进制初始值
+- `t`：平方取模迭代次数
+
+### 插件求解方式：新版 PoW
+
+新版页面加载 `powSolve-*.js` 和 `pow.worker-*.js` 后，worker 的核心逻辑等价于：
+
+```text
+N = BigInt("0x" + json.N)
+y = BigInt("0x" + json.x)
+repeat json.t times:
+    y = (y * y) % N
+```
+
+当前插件不启动浏览器，也不使用 Playwright / Puppeteer / Selenium，而是在 Go 中用 `math/big` 直接复现上述计算。计算结束后，为贴近前端脚本行为，如果总耗时不足 3 秒，会补齐等待时间，然后向当前请求 URL 提交：
+
+```text
+action=verify&id={id}&y={hex(y)}
+```
+
+验证成功后，服务端会下发 `browser_verified`，原请求再重试一次。
+
+### 插件求解方式：旧版哈希枚举
 
 `solveBotChallenge` 的策略很直接：
 

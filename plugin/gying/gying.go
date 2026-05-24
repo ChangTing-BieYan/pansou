@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -42,7 +43,7 @@ import (
 const (
 	MaxConcurrentUsers   = 10   // 最多使用的用户数
 	MaxConcurrentDetails = 50   // 最大并发详情请求数
-	DebugLog             = false // 调试日志开关（排查问题时改为true）
+	DebugLog             = true // 调试日志开关（排查问题时改为true）
 )
 
 // 默认账户配置（可通过Web界面添加更多账户）
@@ -53,8 +54,8 @@ const (
 )
 
 var (
-	challengeJSONPattern  = regexp.MustCompile(`const json=(\{.*?\});const jss=`)
-	searchDataPattern     = regexp.MustCompile(`_obj\.search=(\{.*?\});`)
+	challengeJSONPattern  = regexp.MustCompile(`(?s)const\s+json\s*=\s*(\{.*?\})\s*;\s*const\s+jss\s*=`)
+	searchDataPattern     = regexp.MustCompile(`(?s)_obj\s*\.\s*search\s*=\s*(\{.*?\})\s*;`)
 	accessCodeBlockRegex  = regexp.MustCompile(`[（(]\s*访问码[:：]\s*[^)）]+[)）]`)
 	yearSuffixRegex       = regexp.MustCompile(`[（(]\d{4}[)）]`)
 	baiduLinkRegex        = regexp.MustCompile(`https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]{4})?`)
@@ -560,6 +561,9 @@ type ChallengePageData struct {
 	Challenge []string `json:"challenge"`
 	Diff      int      `json:"diff"`
 	Salt      string   `json:"salt"`
+	N         string   `json:"N"`
+	X         string   `json:"x"`
+	T         int      `json:"t"`
 }
 
 type challengeVerifyResponse struct {
@@ -1623,6 +1627,58 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 	if err := json.Unmarshal(matches[1], &challenge); err != nil {
 		return fmt.Errorf("解析验证数据失败: %w", err)
 	}
+
+	if challenge.ID != "" && challenge.N != "" && challenge.X != "" && challenge.T > 0 {
+		return p.solvePowChallenge(scraper, requestURL, &challenge)
+	}
+
+	return p.solveLegacyHashChallenge(scraper, requestURL, &challenge)
+}
+
+func (p *GyingPlugin) solvePowChallenge(scraper *cloudscraper.Scraper, requestURL string, challenge *ChallengePageData) error {
+	modulus, ok := new(big.Int).SetString(challenge.N, 16)
+	if !ok || modulus.Sign() <= 0 {
+		return fmt.Errorf("PoW验证数据无效: N")
+	}
+
+	y, ok := new(big.Int).SetString(challenge.X, 16)
+	if !ok || y.Sign() < 0 {
+		return fmt.Errorf("PoW验证数据无效: x")
+	}
+	if challenge.T <= 0 {
+		return fmt.Errorf("PoW验证数据无效: t")
+	}
+
+	if DebugLog {
+		fmt.Printf("[Gying] PoW Challenge命中: url=%s id=%s t=%d nBits=%d\n",
+			requestURL, challenge.ID, challenge.T, modulus.BitLen())
+	}
+
+	start := time.Now()
+	for i := 0; i < challenge.T; i++ {
+		y.Mul(y, y)
+		y.Mod(y, modulus)
+	}
+	elapsed := time.Since(start)
+
+	if DebugLog {
+		fmt.Printf("[Gying] PoW Challenge计算完成: id=%s t=%d cost=%s\n",
+			challenge.ID, challenge.T, elapsed.Round(time.Millisecond))
+	}
+
+	if minSolveTime := 3 * time.Second; elapsed < minSolveTime {
+		time.Sleep(minSolveTime - elapsed)
+	}
+
+	form := url.Values{}
+	form.Set("action", "verify")
+	form.Set("id", challenge.ID)
+	form.Set("y", y.Text(16))
+
+	return p.submitChallengeVerification(scraper, requestURL, form)
+}
+
+func (p *GyingPlugin) solveLegacyHashChallenge(scraper *cloudscraper.Scraper, requestURL string, challenge *ChallengePageData) error {
 	if challenge.ID == "" || challenge.Salt == "" || challenge.Diff <= 0 || len(challenge.Challenge) == 0 {
 		return fmt.Errorf("验证数据无效")
 	}
@@ -1711,6 +1767,10 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 		form.Add("nonce[]", strconv.Itoa(nonce))
 	}
 
+	return p.submitChallengeVerification(scraper, requestURL, form)
+}
+
+func (p *GyingPlugin) submitChallengeVerification(scraper *cloudscraper.Scraper, requestURL string, form url.Values) error {
 	resp, err := scraper.Post(requestURL, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
 	if err != nil {
 		return fmt.Errorf("提交验证失败: %w", err)
