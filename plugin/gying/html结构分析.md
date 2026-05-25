@@ -74,11 +74,19 @@ https://www.gying.net
 - `安全验证`
 - `正在进行浏览器计算验证`
 
-挑战页中会出现如下 JS 片段：
+挑战页可能出现如下 JS 片段：
 
 ```javascript
 const json={...};const jss=
 ```
+
+也可能只出现远程 PoW 脚本配置：
+
+```javascript
+const jss={"worker":"//static.filejin.ru/static/file/js/pow.worker-...js"};
+```
+
+后一种流程会通过响应头下发 `browser_pow`，再由前端请求 `/res/pow` 获取真实挑战数据。
 
 当前用于提取挑战数据的正则：
 
@@ -102,7 +110,7 @@ type ChallengePageData struct {
 }
 ```
 
-当前兼容两套验证字段。
+当前兼容三套验证流程：远程 PoW、内嵌 PoW、旧版哈希枚举。
 
 旧版哈希枚举字段含义：
 
@@ -111,16 +119,47 @@ type ChallengePageData struct {
 - `diff`：枚举上限
 - `salt`：参与哈希运算的盐值
 
-新版 PoW 字段含义：
+PoW 字段含义：
 
 - `id`：本次挑战标识
 - `N`：十六进制大整数模数
 - `x`：十六进制初始值
 - `t`：平方取模迭代次数
 
-### 插件求解方式：新版 PoW
+远程 PoW 的 `id` 不在 JSON 中返回，而是由 `browser_pow` Cookie 标记；验证成功后服务端返回 `challenge_id` 并下发 `browser_verified`。
 
-新版页面加载 `powSolve-*.js` 和 `pow.worker-*.js` 后，worker 的核心逻辑等价于：
+### 插件求解方式：远程 PoW
+
+当前站点可能只在验证页中加载 `powSolve-*.js`，真实挑战数据需要通过接口获取：
+
+```text
+GET {baseURL}/res/pow
+```
+
+返回 JSON 形如：
+
+```json
+{"N":"...","x":"...","t":800000}
+```
+
+插件计算完成后提交：
+
+```text
+POST {baseURL}/res/pow
+Content-Type: application/x-www-form-urlencoded
+
+y={hex(y)}
+```
+
+成功响应形如：
+
+```json
+{"success":true,"challenge_id":"..."}
+```
+
+### 插件求解方式：内嵌 PoW
+
+如果页面直接内嵌 `const json={id,N,x,t}`，worker 的核心逻辑等价于：
 
 ```text
 N = BigInt("0x" + json.N)
@@ -129,7 +168,7 @@ repeat json.t times:
     y = (y * y) % N
 ```
 
-当前插件不启动浏览器，也不使用 Playwright / Puppeteer / Selenium，而是在 Go 中用 `math/big` 直接复现上述计算。计算结束后，为贴近前端脚本行为，如果总耗时不足 3 秒，会补齐等待时间，然后向当前请求 URL 提交：
+当前插件不启动浏览器，也不使用 Playwright / Puppeteer / Selenium，而是在 Go 中用 `math/big` 直接复现上述计算。计算结束后，为贴近前端脚本行为，如果总耗时不足 3 秒，会补齐等待时间。内嵌 PoW 会向当前请求 URL 提交：
 
 ```text
 action=verify&id={id}&y={hex(y)}

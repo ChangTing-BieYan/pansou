@@ -43,7 +43,7 @@ import (
 const (
 	MaxConcurrentUsers   = 10   // 最多使用的用户数
 	MaxConcurrentDetails = 50   // 最大并发详情请求数
-	DebugLog             = true // 调试日志开关（排查问题时改为true）
+	DebugLog             = false // 调试日志开关（排查问题时改为true）
 )
 
 // 默认账户配置（可通过Web界面添加更多账户）
@@ -1466,14 +1466,19 @@ func isBotChallengePage(body []byte) bool {
 		return false
 	}
 	bodyText := string(body)
-	if !challengeJSONPattern.Match(body) {
-		return false
-	}
-
-	return strings.Contains(bodyText, "正在确认你是不是机器人") ||
+	hasVerifyText := strings.Contains(bodyText, "正在确认你是不是机器人") ||
 		strings.Contains(bodyText, "浏览器安全验证") ||
 		strings.Contains(bodyText, "安全验证") ||
 		strings.Contains(bodyText, "正在进行浏览器计算验证")
+	if !hasVerifyText {
+		return false
+	}
+
+	return challengeJSONPattern.Match(body) ||
+		strings.Contains(bodyText, "powSolve-") ||
+		strings.Contains(bodyText, "pow.worker-") ||
+		strings.Contains(bodyText, "const jss=") ||
+		strings.Contains(bodyText, "/res/pow")
 }
 
 func isLoginShell(body []byte) bool {
@@ -1620,7 +1625,7 @@ func (p *GyingPlugin) applyProxyToScraper(scraper *cloudscraper.Scraper) error {
 func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestURL string, body []byte) error {
 	matches := challengeJSONPattern.FindSubmatch(body)
 	if len(matches) < 2 {
-		return fmt.Errorf("未找到验证数据")
+		return p.solveRemotePowChallenge(scraper, requestURL)
 	}
 
 	var challenge ChallengePageData
@@ -1635,23 +1640,85 @@ func (p *GyingPlugin) solveBotChallenge(scraper *cloudscraper.Scraper, requestUR
 	return p.solveLegacyHashChallenge(scraper, requestURL, &challenge)
 }
 
+func (p *GyingPlugin) solveRemotePowChallenge(scraper *cloudscraper.Scraper, requestURL string) error {
+	powURL, err := p.buildPowURL(requestURL)
+	if err != nil {
+		return err
+	}
+
+	if DebugLog {
+		fmt.Printf("[Gying] Remote PoW Challenge命中: url=%s powURL=%s\n", requestURL, powURL)
+	}
+
+	body, statusCode, _, err := p.requestWithChallengeRetry(scraper, http.MethodGet, powURL, "", "")
+	if err != nil {
+		return fmt.Errorf("获取PoW验证数据失败: %w", err)
+	}
+	if statusCode != http.StatusOK {
+		return fmt.Errorf("获取PoW验证数据失败: HTTP %d", statusCode)
+	}
+
+	var challenge ChallengePageData
+	if err := json.Unmarshal(body, &challenge); err != nil {
+		return fmt.Errorf("解析PoW验证数据失败: %w", err)
+	}
+	if challenge.N == "" || challenge.X == "" || challenge.T <= 0 {
+		return fmt.Errorf("PoW验证数据无效")
+	}
+
+	y, err := p.computePowResult(&challenge)
+	if err != nil {
+		return err
+	}
+
+	form := url.Values{}
+	form.Set("y", y)
+
+	return p.submitChallengeVerification(scraper, powURL, form)
+}
+
+func (p *GyingPlugin) buildPowURL(requestURL string) (string, error) {
+	parsedURL, err := url.Parse(requestURL)
+	if err != nil {
+		return "", fmt.Errorf("解析验证URL失败: %w", err)
+	}
+	parsedURL.Path = "/res/pow"
+	parsedURL.RawQuery = ""
+	parsedURL.Fragment = ""
+	return parsedURL.String(), nil
+}
+
 func (p *GyingPlugin) solvePowChallenge(scraper *cloudscraper.Scraper, requestURL string, challenge *ChallengePageData) error {
+	y, err := p.computePowResult(challenge)
+	if err != nil {
+		return err
+	}
+
+	form := url.Values{}
+	form.Set("action", "verify")
+	form.Set("id", challenge.ID)
+	form.Set("y", y)
+
+	return p.submitChallengeVerification(scraper, requestURL, form)
+}
+
+func (p *GyingPlugin) computePowResult(challenge *ChallengePageData) (string, error) {
 	modulus, ok := new(big.Int).SetString(challenge.N, 16)
 	if !ok || modulus.Sign() <= 0 {
-		return fmt.Errorf("PoW验证数据无效: N")
+		return "", fmt.Errorf("PoW验证数据无效: N")
 	}
 
 	y, ok := new(big.Int).SetString(challenge.X, 16)
 	if !ok || y.Sign() < 0 {
-		return fmt.Errorf("PoW验证数据无效: x")
+		return "", fmt.Errorf("PoW验证数据无效: x")
 	}
 	if challenge.T <= 0 {
-		return fmt.Errorf("PoW验证数据无效: t")
+		return "", fmt.Errorf("PoW验证数据无效: t")
 	}
 
 	if DebugLog {
-		fmt.Printf("[Gying] PoW Challenge命中: url=%s id=%s t=%d nBits=%d\n",
-			requestURL, challenge.ID, challenge.T, modulus.BitLen())
+		fmt.Printf("[Gying] PoW Challenge计算开始: id=%s t=%d nBits=%d\n",
+			challenge.ID, challenge.T, modulus.BitLen())
 	}
 
 	start := time.Now()
@@ -1670,12 +1737,7 @@ func (p *GyingPlugin) solvePowChallenge(scraper *cloudscraper.Scraper, requestUR
 		time.Sleep(minSolveTime - elapsed)
 	}
 
-	form := url.Values{}
-	form.Set("action", "verify")
-	form.Set("id", challenge.ID)
-	form.Set("y", y.Text(16))
-
-	return p.submitChallengeVerification(scraper, requestURL, form)
+	return y.Text(16), nil
 }
 
 func (p *GyingPlugin) solveLegacyHashChallenge(scraper *cloudscraper.Scraper, requestURL string, challenge *ChallengePageData) error {
