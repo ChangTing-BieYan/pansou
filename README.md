@@ -606,7 +606,17 @@ curl "http://localhost:8888/api/search?kw=唐朝诡事录&filter=%7B%22include%2
 | items[].disk_type | string | 是 | 网盘类型，支持：baidu、aliyun、quark、tianyi、uc、mobile、115、xunlei、123 |
 | items[].url | string | 是 | 完整分享链接 |
 | items[].password | string | 否 | 提取码/密码，未拼接在链接中时可传 |
+| proxy_url | string | 否 | 本次检测请求使用的代理地址，位于请求根节点，支持 `http://`、`https://`、`socks5://`、`socks5h://` |
+| proxy | string | 否 | `proxy_url` 的兼容别名，位于请求根节点；同时传入时以 `proxy_url` 为准 |
 | view_token | string | 否 | 视图标识，用于区分当前前端检测批次 |
+
+**代理行为说明**：
+
+- `proxy_url`/`proxy` 只影响当前 `/api/check/links` 请求，不会修改服务进程的全局代理配置。
+- 单次批量检测共用同一个代理；如需轮换出口IP，可由调用方在不同请求中传入不同代理。
+- 未传 `proxy_url`/`proxy` 时，检测服务沿用启动时的全局HTTP客户端配置。
+- 使用代理时，检测缓存会按代理地址隔离，避免不同出口IP复用同一检测结果。
+- 代理地址格式非法或协议不支持时返回 `400`，不会静默降级为直连。
 
 **请求示例**：
 
@@ -631,6 +641,19 @@ curl -X POST http://localhost:8888/api/check/links \
       }
     ],
     "view_token": "quark-1710000000000"
+  }'
+
+# 指定本次检测使用代理，避免固定出口IP频繁触发风控
+curl -X POST http://localhost:8888/api/check/links \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [
+      {
+        "disk_type": "quark",
+        "url": "https://pan.quark.cn/s/abcdefg"
+      }
+    ],
+    "proxy_url": "socks5://127.0.0.1:1080"
   }'
 
 # 启用认证时
@@ -709,6 +732,12 @@ curl -X POST http://localhost:8888/api/check/links \
 {
   "code": 400,
   "message": "items不能为空"
+}
+
+// 代理参数无效
+{
+  "code": 400,
+  "message": "无效的代理参数: 不支持的代理协议: ftp"
 }
 
 // 未授权（启用认证但未提供Token）

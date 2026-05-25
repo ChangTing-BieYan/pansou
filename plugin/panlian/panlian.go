@@ -965,7 +965,7 @@ func (p *PanlianPlugin) doLogin(username string, password string, remember bool)
 		return "", nil, fmt.Errorf("解析登录响应失败: %w", err)
 	}
 	if !loginResp.Success {
-		return "", nil, fmt.Errorf(strings.TrimSpace(loginResp.Message))
+		return "", nil, errors.New(strings.TrimSpace(loginResp.Message))
 	}
 
 	baseURL, _ := url.Parse(DefaultBaseURL)

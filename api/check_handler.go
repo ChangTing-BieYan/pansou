@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 
 	"github.com/gin-gonic/gin"
@@ -33,6 +34,16 @@ func CheckHandler(c *gin.Context) {
 		return
 	}
 
-	response := getCheckService().Check(req.Items)
+	proxyURL := strings.TrimSpace(req.ProxyURL)
+	if proxyURL == "" {
+		proxyURL = strings.TrimSpace(req.Proxy)
+	}
+
+	response, err := getCheckService().CheckWithProxy(req.Items, proxyURL)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, model.NewErrorResponse(400, "无效的代理参数: "+err.Error()))
+		return
+	}
+
 	c.JSON(http.StatusOK, response)
 }

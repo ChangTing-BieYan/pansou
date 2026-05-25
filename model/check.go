@@ -9,6 +9,8 @@ type CheckItem struct {
 type CheckRequest struct {
 	Items     []CheckItem `json:"items" binding:"required"`
 	ViewToken string      `json:"view_token,omitempty"`
+	Proxy     string      `json:"proxy,omitempty"`
+	ProxyURL  string      `json:"proxy_url,omitempty"`
 }
 
 type CheckResult struct {

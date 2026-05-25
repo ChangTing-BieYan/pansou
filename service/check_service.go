@@ -47,6 +47,8 @@ type activeCheckCall struct {
 	err    error
 }
 
+type checkHTTPClientContextKey struct{}
+
 type cachedCheckDiskEntry struct {
 	Result    model.CheckResult
 	ExpiresAt int64
@@ -74,24 +76,44 @@ func NewCheckService() *CheckService {
 }
 
 func (s *CheckService) Check(items []model.CheckItem) model.CheckResponse {
+	response, _ := s.CheckWithProxy(items, "")
+	return response
+}
+
+func (s *CheckService) CheckWithProxy(items []model.CheckItem, proxyURL string) (model.CheckResponse, error) {
+	proxyURL = strings.TrimSpace(proxyURL)
+	client := s.client
+	cacheScope := ""
+
+	if proxyURL != "" {
+		proxyClient, err := util.NewHTTPClient(proxyURL)
+		if err != nil {
+			return model.CheckResponse{}, err
+		}
+		defer proxyClient.CloseIdleConnections()
+
+		client = proxyClient
+		cacheScope = proxyCacheScope(proxyURL)
+	}
+
 	results := make([]model.CheckResult, 0, len(items))
 
 	for _, item := range items {
-		results = append(results, s.checkOne(item))
+		results = append(results, s.checkOne(item, client, cacheScope))
 	}
 
 	return model.CheckResponse{
 		Results: results,
-	}
+	}, nil
 }
 
-func (s *CheckService) checkOne(item model.CheckItem) model.CheckResult {
+func (s *CheckService) checkOne(item model.CheckItem, client *http.Client, cacheScope string) model.CheckResult {
 	normalized := s.normalizeShareLink(item.DiskType, item.URL, item.Password)
 	if normalized == "" {
 		return s.buildResult(item, "", checkStateUncertain, false, "链接格式无效")
 	}
 
-	cacheKey := item.DiskType + "|" + normalized
+	cacheKey := checkCacheKey(item.DiskType, normalized, cacheScope)
 	if cached, ok := s.getCached(cacheKey); ok {
 		cached.CacheHit = true
 		return cached
@@ -108,7 +130,7 @@ func (s *CheckService) checkOne(item model.CheckItem) model.CheckResult {
 		return result
 	}
 
-	result, err := s.runCheck(item, normalized)
+	result, err := s.runCheck(item, normalized, client)
 	s.finishInflight(cacheKey, call, result, err)
 
 	if err != nil {
@@ -190,32 +212,32 @@ func (s *CheckService) finishInflight(key string, call *activeCheckCall, result 
 	}
 }
 
-func (s *CheckService) runCheck(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) runCheck(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	switch item.DiskType {
 	case "aliyun":
-		return s.checkAliyun(item, normalized)
+		return s.checkAliyun(item, normalized, client)
 	case "quark":
-		return s.checkQuark(item, normalized)
+		return s.checkQuark(item, normalized, client)
 	case "uc":
-		return s.checkUC(item, normalized)
+		return s.checkUC(item, normalized, client)
 	case "baidu":
-		return s.checkBaidu(item, normalized)
+		return s.checkBaidu(item, normalized, client)
 	case "tianyi":
-		return s.checkTianyi(item, normalized)
+		return s.checkTianyi(item, normalized, client)
 	case "123":
-		return s.check123(item, normalized)
+		return s.check123(item, normalized, client)
 	case "xunlei":
-		return s.checkXunlei(item, normalized)
+		return s.checkXunlei(item, normalized, client)
 	case "115":
-		return s.check115(item, normalized)
+		return s.check115(item, normalized, client)
 	case "mobile":
-		return s.checkMobile(item, normalized)
+		return s.checkMobile(item, normalized, client)
 	default:
 		return s.buildResult(item, normalized, checkStateUnsupported, false, "当前平台暂不支持检测"), nil
 	}
 }
 
-func (s *CheckService) checkAliyun(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) checkAliyun(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareID := extractAliyunShareID(normalized)
 	if shareID == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -223,6 +245,7 @@ func (s *CheckService) checkAliyun(item model.CheckItem, normalized string) (mod
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	body, statusCode, err := s.doJSONRequest(ctx, "POST", "https://api.aliyundrive.com/adrive/v3/share_link/get_share_by_anonymous?share_id="+shareID, map[string]string{
 		"share_id": shareID,
@@ -283,7 +306,7 @@ func (s *CheckService) checkAliyun(item model.CheckItem, normalized string) (mod
 	}
 }
 
-func (s *CheckService) checkQuark(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) checkQuark(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	resourceID, password := extractQuarkShareIDAndPassword(normalized)
 	if resourceID == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -291,6 +314,7 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string) (mode
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	tokenBody, _, err := s.doJSONRequest(ctx, "POST", "https://drive-h.quark.cn/1/clouddrive/share/sharepage/token", map[string]any{
 		"pwd_id":                            resourceID,
@@ -412,9 +436,10 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string) (mode
 	}
 }
 
-func (s *CheckService) checkUC(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) checkUC(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	body, statusCode, err := s.doRequest(ctx, "GET", normalized, nil, map[string]string{
 		"user-agent": "Mozilla/5.0 (Linux; Android 10; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -440,7 +465,7 @@ func (s *CheckService) checkUC(item model.CheckItem, normalized string) (model.C
 	}
 }
 
-func (s *CheckService) checkBaidu(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) checkBaidu(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareID, shortURL, password := extractBaiduShareInfo(normalized)
 	if shareID == "" || shortURL == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -448,6 +473,7 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string) (mode
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	var bdclnd string
 	if password != "" {
@@ -518,7 +544,7 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string) (mode
 	}
 }
 
-func (s *CheckService) checkTianyi(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) checkTianyi(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareCode, password, referer := extractTianyiShareInfo(normalized, item.Password)
 	if shareCode == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -526,6 +552,7 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string) (mod
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	noCache := fmt.Sprintf("%f", rand.New(rand.NewSource(time.Now().UnixNano())).Float64())
 	shareCodeParam := shareCode
@@ -641,7 +668,7 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string) (mod
 	}
 }
 
-func (s *CheckService) check123(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) check123(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareKey := extract123ShareKey(normalized)
 	if shareKey == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -649,6 +676,7 @@ func (s *CheckService) check123(item model.CheckItem, normalized string) (model.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	apiURL := fmt.Sprintf("https://www.123pan.com/api/share/info?shareKey=%s", url.QueryEscape(shareKey))
 	body, statusCode, err := s.doRequest(ctx, "GET", apiURL, nil, nil)
@@ -683,7 +711,7 @@ func (s *CheckService) check123(item model.CheckItem, normalized string) (model.
 	}
 }
 
-func (s *CheckService) checkXunlei(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) checkXunlei(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareID, password := extractXunleiShareInfo(normalized)
 	if shareID == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -691,6 +719,7 @@ func (s *CheckService) checkXunlei(item model.CheckItem, normalized string) (mod
 
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	captchaToken, _ := s.fetchXunleiCaptchaToken(ctx)
 
@@ -768,7 +797,7 @@ func (s *CheckService) checkXunlei(item model.CheckItem, normalized string) (mod
 	}
 }
 
-func (s *CheckService) check115(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) check115(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareCode, password := extract115ShareInfo(normalized, item.Password)
 	if shareCode == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -779,6 +808,7 @@ func (s *CheckService) check115(item model.CheckItem, normalized string) (model.
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	apiURL := fmt.Sprintf("https://115cdn.com/webapi/share/snap?share_code=%s&offset=0&limit=20&receive_code=%s&cid=",
 		url.QueryEscape(shareCode), url.QueryEscape(password))
@@ -857,7 +887,7 @@ func (s *CheckService) check115(item model.CheckItem, normalized string) (model.
 	return s.buildResult(item, normalized, checkStateBad, false, response.Error), nil
 }
 
-func (s *CheckService) checkMobile(item model.CheckItem, normalized string) (model.CheckResult, error) {
+func (s *CheckService) checkMobile(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {
 	shareID := extractMobileShareID(normalized)
 	if shareID == "" {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法解析分享地址"), nil
@@ -865,6 +895,7 @@ func (s *CheckService) checkMobile(item model.CheckItem, normalized string) (mod
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	ctx = contextWithCheckHTTPClient(ctx, client)
 
 	requestPayload := map[string]any{
 		"getOutLinkInfoReq": map[string]any{
@@ -969,7 +1000,12 @@ func (s *CheckService) doRequest(ctx context.Context, method, targetURL string, 
 		req.Header.Set(key, value)
 	}
 
-	resp, err := s.client.Do(req)
+	client := checkHTTPClientFromContext(ctx)
+	if client == nil {
+		client = s.client
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -981,6 +1017,30 @@ func (s *CheckService) doRequest(ctx context.Context, method, targetURL string, 
 	}
 
 	return raw, resp.StatusCode, nil
+}
+
+func contextWithCheckHTTPClient(ctx context.Context, client *http.Client) context.Context {
+	if client == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, checkHTTPClientContextKey{}, client)
+}
+
+func checkHTTPClientFromContext(ctx context.Context) *http.Client {
+	client, _ := ctx.Value(checkHTTPClientContextKey{}).(*http.Client)
+	return client
+}
+
+func checkCacheKey(diskType, normalized, cacheScope string) string {
+	if cacheScope == "" {
+		return diskType + "|" + normalized
+	}
+	return diskType + "|" + normalized + "|" + cacheScope
+}
+
+func proxyCacheScope(proxyURL string) string {
+	sum := md5.Sum([]byte(strings.TrimSpace(proxyURL)))
+	return fmt.Sprintf("proxy:%x", sum)
 }
 
 func (s *CheckService) fetchXunleiCaptchaToken(ctx context.Context) (string, error) {
